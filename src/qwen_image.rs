@@ -2,10 +2,11 @@ use burn::{
     Tensor,
     config::Config,
     module::{Module, Param},
-    nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig},
+    nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d},
     tensor::{
         Bool, Device, FloatDType, Int,
         activation::{gelu_approximate, silu},
+        ops::PadMode,
         s,
     },
 };
@@ -313,4 +314,76 @@ impl QwenImageAdaLayerNormContinuousConfig {
             eps: self.eps,
         }
     }
+}
+
+const FLEX_BLOCK_SIZE: usize = 128;
+
+fn build_qwenimage_block_causal_mask(
+    mut image_ids: Tensor<1, Int>,
+    encoder_hidden_states_mask: Option<Tensor<2, Bool>>,
+    batch_size: usize,
+) -> Tensor<4, Bool> {
+    // image_ids: (seq_len,)
+    // encoder_hidden_states_mask: (batch_size, seq_len)
+    let device = &image_ids.device();
+
+    let seq_len = image_ids.dims()[0];
+    let padded_seq_len =
+        ((seq_len as f64 / FLEX_BLOCK_SIZE as f64).ceil() * FLEX_BLOCK_SIZE as f64) as usize;
+    let padding_len = padded_seq_len - seq_len;
+    if padding_len > 0 {
+        let pad_tensor = Tensor::<1, Int>::full([padding_len], -1, device);
+        image_ids = Tensor::cat(vec![image_ids, pad_tensor], 0);
+    }
+    let key_valid = if let Some(encoder_hidden_states_mask) = encoder_hidden_states_mask {
+        let pad_tensor = Tensor::<2, Bool>::full([batch_size, padding_len], false, device);
+        Tensor::cat(vec![encoder_hidden_states_mask, pad_tensor], 1)
+    } else {
+        Tensor::<2>::ones([batch_size, padded_seq_len], device).bool()
+    };
+
+    let idxs = Tensor::<1, Int>::arange(0..padded_seq_len as i64, device);
+    let q_idx = idxs.clone().unsqueeze_dim::<2>(1); // (padded_seq_len, 1)
+    let kv_idx = idxs.unsqueeze_dim::<2>(0); // (1, padded_seq_len)
+
+    let q_image_id = image_ids.clone().unsqueeze_dim::<2>(1); // (padded_seq_len, 1)
+    let kv_image_id = image_ids.unsqueeze_dim::<2>(0); // (1, padded_seq_len)
+    let same_image_block = q_image_id
+        .clone()
+        .equal(kv_image_id)
+        .bool_and(q_image_id.greater_equal_elem(0));
+
+    let causal = q_idx.clone().greater_equal(kv_idx.clone());
+
+    let allowed_spatial = causal.bool_or(same_image_block);
+
+    let q_not_pad = q_idx.lower_elem(seq_len as i64);
+    let kv_not_pad = kv_idx.lower_elem(seq_len as i64);
+    let not_padding = q_not_pad.bool_and(kv_not_pad);
+
+    let base_mask = allowed_spatial.bool_and(not_padding);
+
+    let base_mask = base_mask.unsqueeze_dims::<4>(&[0, 1]); // (1, 1, padded_seq_len, padded_seq_len)
+    let key_valid_broadcast = key_valid.unsqueeze_dims::<4>(&[1, 2]); // (batch_size, 1, 1, padded_seq_len)
+
+    let final_mask = base_mask.bool_and(key_valid_broadcast);
+    final_mask
+}
+
+fn qwenimage_prefix_segments(
+    image_ids: Tensor<1, Int>,
+    prefix_len: usize,
+) -> Vec<(usize, usize, bool)> {
+    // image_ids: (seq_len,)
+    let prefix_ids = image_ids.slice(s![0..prefix_len]); // (perfix_len,)
+    let prefix_ids = prefix_ids.into_data().try_into_vec::<i64>().unwrap();
+    let mut segments = vec![];
+    let mut start = 0;
+    for index in 1..=prefix_len {
+        if index == prefix_len || prefix_ids[index] != prefix_ids[start] {
+            segments.push((start, index, prefix_ids[start] < 0));
+            start = index;
+        }
+    }
+    segments
 }
