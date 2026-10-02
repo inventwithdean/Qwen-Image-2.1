@@ -11,6 +11,8 @@ use burn::{
     },
 };
 
+use crate::normalization::RMSNorm;
+
 // use_real_unbind_dim = -1
 fn apply_rotary_emb_qwen(x: Tensor<4>, freqs_cis: (Tensor<2>, Tensor<2>)) -> Tensor<4> {
     // x: (Batch, Sequence, Heads, Dimension)
@@ -375,7 +377,7 @@ fn qwenimage_prefix_segments(
     prefix_len: usize,
 ) -> Vec<(usize, usize, bool)> {
     // image_ids: (seq_len,)
-    let prefix_ids = image_ids.slice(s![0..prefix_len]); // (perfix_len,)
+    let prefix_ids = image_ids.slice(s![0..prefix_len]); // (prefix_len,)
     let prefix_ids = prefix_ids.into_data().try_into_vec::<i64>().unwrap();
     let mut segments = vec![];
     let mut start = 0;
@@ -386,4 +388,20 @@ fn qwenimage_prefix_segments(
         }
     }
     segments
+}
+
+#[derive(Module, Debug)]
+struct QwenImageAttention {
+    to_q: Linear,
+    to_k: Linear,
+    to_v: Linear,
+    to_out: Vec<Linear>, // (Original ModuleList is [Linear, Dropout] but dropout isn't used in training and we need the name mapping to work, so using Vec<Linear>)
+    norm_q: RMSNorm,
+    norm_k: RMSNorm,
+}
+
+impl QwenImageAttention {
+    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
+        
+    }
 }

@@ -1,0 +1,42 @@
+use burn::{
+    Tensor,
+    config::Config,
+    module::{Module, Param},
+    tensor::Device,
+};
+
+// elementwise_affine = true
+// bias = false
+#[derive(Module, Debug)]
+pub struct RMSNorm {
+    dim: usize,
+    eps: f64,
+    weight: Param<Tensor<1>>,
+}
+
+impl RMSNorm {
+    fn forward(&self, hidden_states: Tensor<4>) -> Tensor<4> {
+        // hidden_states: (B, S, H, D)
+        let variance = hidden_states.clone().powf_scalar(2.0).mean_dim(3); // (B, S, H, 1)
+        let normalized = hidden_states * (variance + self.eps).sqrt().recip(); // (B, S, H, D)
+
+        let weight = self.weight.val().unsqueeze_dims::<4>(&[0, 1, 2]); // (1, 1, 1, D)
+        normalized * weight
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct RMSNormConfig {
+    dim: usize,
+    eps: f64,
+}
+
+impl RMSNormConfig {
+    pub fn init(&self, device: &Device) -> RMSNorm {
+        RMSNorm {
+            dim: self.dim,
+            eps: self.eps,
+            weight: Param::from_tensor(Tensor::ones([self.dim], device)),
+        }
+    }
+}
