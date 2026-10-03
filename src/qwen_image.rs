@@ -1,838 +1,397 @@
+use std::{fs, path::PathBuf, time::Instant};
+
 use burn::{
     Tensor,
     config::Config,
-    module::{Module, Param},
-    nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d},
-    tensor::{
-        Bool, Device, FloatDType, Int,
-        activation::{gelu_approximate, silu, softmax},
-        ops::PadMode,
-        s,
-    },
+    module::Module,
+    nn::{Linear, LinearConfig},
+    store::ModuleRecord,
+    tensor::{Bool, Bytes, Device, IndexingUpdateOp, Int, activation::silu, s},
 };
 
-use crate::normalization::{RMSNorm, RMSNormConfig};
+use crate::qwen_image_modules::{
+    KvCacheMode, QwenImageAdaLayerNormContinuous, QwenImageAdaLayerNormContinuousConfig,
+    QwenImageKVCache, QwenImageRope, QwenImageRopeConfig, QwenImageTextProjection,
+    QwenImageTextProjectionConfig, QwenImageTimestepProjEmbeddings,
+    QwenImageTimestepProjEmbeddingsConfig, QwenImageTransformerBlock,
+    QwenImageTransformerBlockConfig, qwenimage_prefix_segments,
+};
 
-// use_real_unbind_dim = -1
-fn apply_rotary_emb_qwen(x: Tensor<4>, freqs_cis: (Tensor<2>, Tensor<2>)) -> Tensor<4> {
-    // x: (Batch, Sequence, Heads, Dimension)
-    // cos: (S, D)
-    // sin: (S, D)
-
-    let [b, s, h, d] = x.dims();
-    let (cos, sin) = freqs_cis;
-    let cos = cos.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(2); // (1, S, D) then (1, S, 1, D)
-    let sin = sin.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(2); // (1, S, D) then (1, S, 1, D)
-
-    let x_reshaped = x.clone().reshape([b, s, h, d / 2, 2]); // (Assuming d is exactly divisible by 2)
-    let x_real = x_reshaped.clone().slice_dim(4, 0).squeeze_dim::<4>(4); // (B, S, H, D/2)
-    let x_imag = x_reshaped.clone().slice_dim(4, 1).squeeze_dim::<4>(4); // (B, S, H, D/2)
-    let x_rotated = Tensor::stack::<5>(vec![-x_imag, x_real], 4); // (B, S, H, D/2, 2)
-    let x_rotated = x_rotated.reshape([b, s, h, d]);
-
-    x * cos + x_rotated * sin // (B, S, H, D)
+pub struct QwenImageBlockStreamer {
+    pub num_layers: usize,
+    records: Vec<ModuleRecord>,
+    active_block: Option<QwenImageTransformerBlock>,
 }
 
-// timestep_dim = 256
-// max_period = 10_000
-// time_factor = 1_000.0
-#[derive(Module, Debug)]
-struct QwenImageTemporalTimesteps {
-    // (half,) or (128,)
-    freqs: Tensor<1>,
-    time_factor: f64,
-}
+impl QwenImageBlockStreamer {
+    pub fn new(
+        dir: impl Into<PathBuf>,
+        config: &QwenImageTransformerModelConfig,
+        device: &Device,
+    ) -> Self {
+        let dir_path = dir.into();
+        let inner_dim = config.num_attention_heads * config.attention_head_dim;
+        let block_config = QwenImageTransformerBlockConfig::new(
+            inner_dim,
+            config.num_attention_heads,
+            config.attention_head_dim,
+            config.mlp_ratio,
+            config.eps,
+        );
+        let mut records = Vec::with_capacity(config.num_layers);
+        println!("Loading {} layers into System RAM...", config.num_layers);
 
-impl QwenImageTemporalTimesteps {
-    fn forward(&self, timestep: Tensor<1>) -> Tensor<2> {
-        // timestep: (B,)
-        let timestep = self.time_factor * timestep;
-        let timestep = timestep.unsqueeze_dim::<2>(1); // (B, 1)
-        let freqs = self.freqs.clone().unsqueeze_dim::<2>(0); // (1, half)
-        let args = timestep * freqs;
-        let cos = args.clone().cos(); // (B, half)
-        let sin = args.clone().sin(); // (B, half)
-        Tensor::cat(vec![cos, sin], 1) // (B, timestep_dim) as half * 2 = timestep_dim
-    }
-}
+        let start = Instant::now();
+        for layer in 0..config.num_layers {
+            let path = dir_path.join(format!("block_{layer}.mpk"));
+            let bytes = fs::read(&path).expect("Failed to read block file");
+            let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(bytes)).unwrap();
+            records.push(record);
+        }
 
-#[derive(Config, Debug)]
-struct QwenImageTemporalTimestepsConfig {
-    timestep_dim: usize,
-    #[config(default = 10_000)]
-    max_period: usize,
-    #[config(default = 1_000.0)]
-    time_factor: f64,
-}
+        let active_block = block_config.init(device);
 
-impl QwenImageTemporalTimestepsConfig {
-    fn init(&self, device: &Device) -> QwenImageTemporalTimesteps {
-        let half = (self.timestep_dim / 2) as f64;
-        let freqs = -(self.max_period as f64).ln()
-            * Tensor::arange(0..half as i64, device).cast(FloatDType::F32)
-            / half;
-        let freqs = freqs.exp();
-        QwenImageTemporalTimesteps {
-            freqs,
-            time_factor: self.time_factor,
+        println!("Loaded in {:.2?}", start.elapsed());
+        Self {
+            num_layers: config.num_layers,
+            records,
+            active_block: Some(active_block),
         }
     }
-}
 
-// in_channels = 256
-// time_embed_dim = num_attention_head * attention_head_dim
-// sample_proj_bias = False
-// act_fn = silu
-// out_dim = None
-// post_act_fn = None
-// cond_proj_dim = None
-#[derive(Module, Debug)]
-struct TimestepEmbedding {
-    linear_1: Linear,
-    linear_2: Linear,
-}
+    pub fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
+        let record = self.records[layer].clone();
 
-impl TimestepEmbedding {
-    fn forward(&self, mut sample: Tensor<2>) -> Tensor<2> {
-        sample = self.linear_1.forward(sample);
-        sample = silu(sample);
-        self.linear_2.forward(sample)
+        let block = self
+            .active_block
+            .take()
+            .expect("Active block not initialized");
+        let updated_block = block.load_record(record);
+        self.active_block = Some(updated_block);
+        self.active_block.as_ref().unwrap()
     }
-}
 
-#[derive(Config, Debug)]
-struct TimestepEmbeddingConfig {
-    in_channels: usize,
-    time_embed_dim: usize,
-}
-
-impl TimestepEmbeddingConfig {
-    fn init(&self, device: &Device) -> TimestepEmbedding {
-        let time_embed_dim_out = self.time_embed_dim;
-        TimestepEmbedding {
-            linear_1: LinearConfig::new(self.in_channels, self.time_embed_dim)
-                .with_bias(false)
-                .init(device),
-            linear_2: LinearConfig::new(self.time_embed_dim, time_embed_dim_out)
-                .with_bias(false)
-                .init(device),
-        }
+    pub fn load_layer(&mut self, layer: usize) -> &QwenImageTransformerBlock {
+        self.get(layer)
     }
 }
 
 #[derive(Module, Debug)]
-struct QwenImageTimestepProjEmbeddings {
-    time_proj: QwenImageTemporalTimesteps,
-    timestep_embedder: TimestepEmbedding,
-}
-
-impl QwenImageTimestepProjEmbeddings {
-    fn forward(&self, timestep: Tensor<1>) -> Tensor<2> {
-        let timesteps_proj = self.time_proj.forward(timestep);
-        self.timestep_embedder.forward(timesteps_proj)
-    }
-}
-
-#[derive(Config, Debug)]
-struct QwenImageTimestepProjEmbeddingsConfig {
-    embedding_dim: usize,
-}
-
-impl QwenImageTimestepProjEmbeddingsConfig {
-    fn init(&self, device: &Device) -> QwenImageTimestepProjEmbeddings {
-        QwenImageTimestepProjEmbeddings {
-            time_proj: QwenImageTemporalTimestepsConfig::new(256).init(device),
-            timestep_embedder: TimestepEmbeddingConfig::new(256, self.embedding_dim).init(device),
-        }
-    }
-}
+pub struct DummyModule {}
 
 #[derive(Module, Debug)]
-struct QwenImageZeroCenterRMSNorm {
-    // (dim,)
-    weight: Param<Tensor<1>>,
-    eps: f64,
+pub struct QwenImageTransformerModel {
+    pos_embed: QwenImageRope,
+    time_text_embed: QwenImageTimestepProjEmbeddings,
+    txt_in: QwenImageTextProjection,
+    img_in: Linear,
+    modulation: (DummyModule, Linear), // Original is nn.Sequential[nn.SiLU(), nn.Linear()].
+    transformer_blocks: Vec<QwenImageTransformerBlock>,
+    norm_out: QwenImageAdaLayerNormContinuous,
+    proj_out: Linear,
 }
 
-impl QwenImageZeroCenterRMSNorm {
-    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
-        // hidden_states: (B, S, D)
-        let arg = hidden_states.clone().powf_scalar(2.0).mean_dim(1) + self.eps;
-        let rrms = arg.sqrt().recip();
-        let weight = self
-            .weight
-            .val()
-            .unsqueeze_dim::<2>(0)
-            .unsqueeze_dim::<3>(0)
-            + 1.0; // (1, dim)
-        hidden_states * rrms * weight
-    }
-}
+impl QwenImageTransformerModel {
+    pub fn build_token_metadata(
+        image_pad_mask: Tensor<1, Bool>,
+        img_shapes: Vec<(usize, usize, usize)>,
+        device: &Device,
+    ) -> (Tensor<1, Int>, Tensor<1, Bool>) {
+        let image_pad_mask_vec = image_pad_mask
+            .into_data()
+            .iter::<bool>()
+            .collect::<Vec<bool>>();
 
-#[derive(Config, Debug)]
-struct QwenImageZeroCenterRMSNormConfig {
-    dim: usize,
-    eps: f64,
-}
+        let mut image_ids_vec = vec![-1_i64; image_pad_mask_vec.len()];
+        let mut target_token_mask_vec = vec![false; image_pad_mask_vec.len()];
 
-impl QwenImageZeroCenterRMSNormConfig {
-    fn init(&self, device: &Device) -> QwenImageZeroCenterRMSNorm {
-        QwenImageZeroCenterRMSNorm {
-            weight: Param::from_tensor(Tensor::zeros([self.dim], device)),
-            eps: self.eps,
-        }
-    }
-}
+        let block_lengths: Vec<usize> = img_shapes.iter().map(|s| s.0 * s.1 * s.2).collect();
 
-// act = GELU(approximate=tanh)
-#[derive(Module, Debug)]
-struct QwenImageTextProjection {
-    text_norm: QwenImageZeroCenterRMSNorm,
-    in_layer: Linear,
-    out_layer: Linear,
-}
-
-impl QwenImageTextProjection {
-    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
-        let hidden_states = self.text_norm.forward(hidden_states);
-        let hidden_states = self.in_layer.forward(hidden_states);
-        let hidden_states = gelu_approximate(hidden_states);
-        self.out_layer.forward(hidden_states)
-    }
-}
-
-#[derive(Config, Debug)]
-struct QwenImageTextProjectionConfig {
-    context_in_dim: usize,
-    hidden_size: usize,
-    eps: f64,
-}
-
-impl QwenImageTextProjectionConfig {
-    fn init(&self, device: &Device) -> QwenImageTextProjection {
-        QwenImageTextProjection {
-            text_norm: QwenImageZeroCenterRMSNormConfig::new(self.context_in_dim, self.eps)
-                .init(device),
-            in_layer: LinearConfig::new(self.context_in_dim, self.hidden_size)
-                .with_bias(false)
-                .init(device),
-            out_layer: LinearConfig::new(self.hidden_size, self.hidden_size)
-                .with_bias(false)
-                .init(device),
-        }
-    }
-}
-
-#[derive(Module, Debug)]
-struct QwenImageSwiGLUFeedForward {
-    proj: Linear,
-    out: Linear,
-    gate_layer: Linear,
-}
-
-impl QwenImageSwiGLUFeedForward {
-    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
-        let gate_out = silu(self.gate_layer.forward(hidden_states.clone()));
-        let other = self.proj.forward(hidden_states);
-        self.out.forward(gate_out * other)
-    }
-}
-
-#[derive(Config, Debug)]
-struct QwenImageSwiGLUFeedForwardConfig {
-    hidden_size: usize,
-    mlp_hidden_size: usize,
-}
-
-impl QwenImageSwiGLUFeedForwardConfig {
-    fn init(&self, device: &Device) -> QwenImageSwiGLUFeedForward {
-        QwenImageSwiGLUFeedForward {
-            proj: LinearConfig::new(self.hidden_size, self.mlp_hidden_size)
-                .with_bias(false)
-                .init(device),
-            out: LinearConfig::new(self.mlp_hidden_size, self.hidden_size)
-                .with_bias(false)
-                .init(device),
-            gate_layer: LinearConfig::new(self.hidden_size, self.mlp_hidden_size)
-                .with_bias(false)
-                .init(device),
-        }
-    }
-}
-
-#[derive(Module, Debug)]
-struct QwenLayerNorm {
-    eps: f64,
-}
-
-impl QwenLayerNorm {
-    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
-        // hidden_states: (B, S, D)
-        let mean = hidden_states.clone().mean_dim(2); // (B, S, 1)
-        let diff = hidden_states.clone() - mean; // (B, S, D)
-        let var = diff.clone().powf_scalar(2.0).mean_dim(2); // (B, S, 1)
-        diff / (var + self.eps).sqrt() // (B, S, D)
-    }
-}
-
-#[derive(Config, Debug)]
-struct QwenLayerNormConfig {
-    eps: f64,
-}
-
-impl QwenLayerNormConfig {
-    fn init(&self) -> QwenLayerNorm {
-        QwenLayerNorm { eps: self.eps }
-    }
-}
-
-#[derive(Module, Debug)]
-struct QwenImageAdaLayerNormContinuous {
-    linear: Linear,
-    norm: QwenLayerNorm, // Burn doesn't supports elementwise_affine=False in LayerNorm as of now
-    eps: f64,
-}
-
-impl QwenImageAdaLayerNormContinuous {
-    fn forward(
-        &self,
-        hidden_states: Tensor<3>,
-        conditioning_embedding: Tensor<2>,
-        target_token_mask: Tensor<1, Bool>,
-    ) -> Tensor<3> {
-        // hidden_states: (B, S, D)
-        // conditioning_embedding: (B+1, D)
-        // target_token_mask: (S)
-
-        let normalized_hidden_states = self.norm.forward(hidden_states); // (B, S, D)
-
-        let scale = self.linear.forward(silu(conditioning_embedding));
-        let scale = select_modulation_rows(scale, Some(target_token_mask));
-        normalized_hidden_states * (1.0 + scale)
-    }
-}
-
-fn select_modulation_rows(
-    params: Tensor<2>,
-    target_token_mask: Option<Tensor<1, Bool>>,
-) -> Tensor<3> {
-    // params: (B+1, D)
-    // target_token_mask: (seq_len,)
-    if let Some(target_token_mask) = target_token_mask {
-        let [b, _d] = params.dims();
-        let real = params.clone().slice(s![0..b - 1, ..]).unsqueeze_dim::<3>(1); // (B, 1, D)
-        let zero = params.slice(s![b - 1.., ..]).unsqueeze_dim::<3>(0); // (1, 1, D)
-        let target_token_mask = target_token_mask.unsqueeze_dims::<3>(&[0, 2]); // (1. seq_len, 1)
-        zero.mask_where(target_token_mask, real)
-    } else {
-        params.unsqueeze_dim::<3>(1)
-    }
-}
-
-#[derive(Config, Debug)]
-struct QwenImageAdaLayerNormContinuousConfig {
-    embedding_dim: usize,
-    conditioning_embedding_dim: usize,
-    eps: f64,
-}
-
-impl QwenImageAdaLayerNormContinuousConfig {
-    fn init(&self, device: &Device) -> QwenImageAdaLayerNormContinuous {
-        QwenImageAdaLayerNormContinuous {
-            linear: LinearConfig::new(self.conditioning_embedding_dim, self.embedding_dim)
-                .with_bias(false)
-                .init(device),
-            norm: QwenLayerNormConfig::new(self.eps).init(),
-            eps: self.eps,
-        }
-    }
-}
-
-fn qwenimage_prefix_segments(
-    image_ids: Tensor<1, Int>,
-    prefix_len: usize,
-) -> Vec<(usize, usize, bool)> {
-    // image_ids: (seq_len,)
-    let prefix_ids = image_ids.slice(s![0..prefix_len]); // (prefix_len,)
-    let prefix_ids = prefix_ids.into_data().try_into_vec::<i64>().unwrap();
-    let mut segments = vec![];
-    let mut start = 0;
-    for index in 1..=prefix_len {
-        if index == prefix_len || prefix_ids[index] != prefix_ids[start] {
-            segments.push((start, index, prefix_ids[start] < 0));
-            start = index;
-        }
-    }
-    segments
-}
-
-/// Stores the K and V projecctions (post-RoPE) for the prefix extracted at the first denoising step.
-/// K and V both are of shape: (batch_size, num_prefix_tokens, num_heads, head_dim)
-#[derive(Clone)]
-struct QwenImageKVLayerCache {
-    k: Tensor<4>,
-    v: Tensor<4>,
-}
-
-impl QwenImageKVLayerCache {
-    fn store(&mut self, k: Tensor<4>, v: Tensor<4>) {
-        self.k = k;
-        self.v = v;
-    }
-
-    fn get(&self) -> (Tensor<4>, Tensor<4>) {
-        (self.k.clone(), self.v.clone())
-    }
-}
-
-struct QwenImageKVCache {
-    layer_caches: Vec<QwenImageKVLayerCache>,
-}
-
-impl QwenImageKVCache {
-    fn get_layer(&self, layer_idx: usize) -> QwenImageKVLayerCache {
-        self.layer_caches[layer_idx].clone()
-    }
-}
-
-enum KvCacheMode {
-    EXTRACT,
-    CACHED,
-}
-
-#[derive(Module, Debug)]
-struct QwenImageAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Vec<Linear>, // (Original ModuleList was [Linear, Dropout] but dropout isn't used in inference and we need the name mapping to work, so using Vec<Linear>)
-    norm_q: RMSNorm,
-    norm_k: RMSNorm,
-}
-
-fn attention(
-    query: Tensor<4>,
-    key: Tensor<4>,
-    value: Tensor<4>,
-    attention_mask: Option<Tensor<4, Bool>>,
-) -> Tensor<4> {
-    // query, key and value are of shape: (B, S, H, D)
-    let query = query.swap_dims(1, 2); // (B, H, S, D)
-    let key = key.swap_dims(1, 2); // (B, H, S, D)
-    let value = value.swap_dims(1, 2); // (B, H, S, D)
-
-    let head_dim = query.dims()[3] as f64;
-    let scale = 1.0 / head_dim.sqrt();
-
-    // (B, H, S, D) @ (B, H, D, S) => (B, H, S, S)
-    let mut scores = query.matmul(key.transpose()) * scale;
-    if let Some(mask) = attention_mask {
-        // ⚠️ Change when using F16
-        let neg_inf = Tensor::zeros_like(&scores).add_scalar(f32::NEG_INFINITY);
-        scores = scores.mask_where(mask.bool_not(), neg_inf);
-    }
-    let weights = softmax(scores, 3); // (B, H, S, S)
-    // (B, H, S, S) @ (B, H, S, D) => (B, H, S, D)
-    let context = weights.matmul(value);
-    context.swap_dims(1, 2) //(B, S, H, D)
-}
-
-impl QwenImageAttention {
-    fn forward(
-        &self,
-        hidden_states: Tensor<3>,
-        attention_mask: Option<Tensor<4, Bool>>,
-        rotary_emb: (Tensor<2>, Tensor<2>),
-        layer_cache: Option<&mut QwenImageKVLayerCache>,
-        kv_cache_mode: Option<KvCacheMode>,
-        prefix_len: usize,
-        segments: Option<Vec<(usize, usize, bool)>>,
-        key_valid: Option<Tensor<2, Bool>>,
-    ) -> Tensor<3> {
-        let num_attention_heads = 32;
-        let head_dim = 128;
-        let [b, s, _] = hidden_states.dims();
-        let query = self.to_q.forward(hidden_states.clone()); // (B, S, 4096)
-        let key = self.to_k.forward(hidden_states.clone()); // (B, S, 4096)
-        let value = self.to_v.forward(hidden_states.clone()); // (B, S, 4096)
-
-        let mut query = query.reshape([b, s, num_attention_heads, head_dim]);
-        let mut key = key.reshape([b, s, num_attention_heads, head_dim]);
-        let mut value = value.reshape([b, s, num_attention_heads, head_dim]);
-        // All are of shape (B, S, 32, 128) now
-
-        query = self.norm_q.forward(query);
-        key = self.norm_k.forward(key);
-
-        query = apply_rotary_emb_qwen(query, rotary_emb.clone());
-        key = apply_rotary_emb_qwen(key, rotary_emb);
-        if let (Some(layer_cache), Some(kv_cache_mode)) = (layer_cache, kv_cache_mode) {
-            match kv_cache_mode {
-                KvCacheMode::EXTRACT => {
-                    layer_cache.store(
-                        key.clone().slice(s![.., ..prefix_len, .., ..]),
-                        value.clone().slice(s![.., ..prefix_len, .., ..]),
-                    );
-                }
-                KvCacheMode::CACHED => {
-                    let (cached_k, cached_v) = layer_cache.get();
-                    key = Tensor::cat(vec![cached_k, key], 1);
-                    value = Tensor::cat(vec![cached_v, value], 1);
-                }
-            }
-        }
-        let seq_len_q = query.dims()[1];
-
-        let hidden_states = if let Some(segments) = segments {
-            let prefix_len = segments.last().unwrap().1;
-            let mut outputs = vec![];
-            for (start, end, is_text) in segments {
-                let mut seg_mask = None;
-                if is_text {
-                    let seg_len = end - start;
-                    // (1, 1, seg_len, end)
-                    seg_mask = Some(
-                        Tensor::cat(
-                            vec![
-                                Tensor::<2, Int>::ones([seg_len, start], &query.device()).bool(),
-                                Tensor::<2, Int>::ones([seg_len, seg_len], &query.device())
-                                    .tril(0)
-                                    .bool(),
-                            ],
-                            1,
-                        )
-                        .unsqueeze_dims::<4>(&[0, 1]),
-                    );
-                }
-                if let Some(key_valid) = key_valid.clone() {
-                    let mut seg_key_valid = key_valid.unsqueeze_dims::<4>(&[1, 2]); // (B, 1, 1, S)
-                    seg_key_valid = seg_key_valid.slice(s![.., .., .., 0..end]);
-                    seg_mask = match seg_mask {
-                        Some(mask) => Some(mask.bool_and(seg_key_valid)),
-                        None => Some(seg_key_valid),
+        let mut img_token_idx = 0;
+        for (i, &is_img) in image_pad_mask_vec.iter().enumerate() {
+            if is_img {
+                let mut sum = 0;
+                for (b, &len) in block_lengths.iter().enumerate() {
+                    sum += len;
+                    if img_token_idx < sum {
+                        image_ids_vec[i] = b as i64;
+                        // The last block is always the target image
+                        if b == block_lengths.len() - 1 {
+                            target_token_mask_vec[i] = true;
+                        }
+                        break;
                     }
                 }
-
-                outputs.push(attention(
-                    query.clone().slice(s![.., start..end, .., ..]),
-                    key.clone().slice(s![.., 0..end, .., ..]),
-                    value.clone().slice(s![.., 0..end, .., ..]),
-                    seg_mask,
-                ));
+                img_token_idx += 1;
             }
-            // (B, 1, 1, S)
-            let trailing_mask = key_valid.map(|kv| kv.unsqueeze_dims::<4>(&[1, 2]));
-            outputs.push(attention(
-                query.slice(s![.., prefix_len.., .., ..]),
-                key,
-                value,
-                trailing_mask,
-            ));
-
-            let prefill_hidden_states = Tensor::cat(outputs, 1);
-            prefill_hidden_states.slice(s![.., 0..seq_len_q, .., ..]) // (B, S, 32, 128)
-        } else {
-            let decode_hidden_states = attention(query, key, value, attention_mask);
-            decode_hidden_states.slice(s![.., 0..seq_len_q, .., ..])
-        };
-
-        let hidden_states = hidden_states.reshape([b, seq_len_q, num_attention_heads * head_dim]);
-        let hidden_states = self.to_out[0].forward(hidden_states);
-
-        hidden_states
-    }
-}
-
-#[derive(Config, Debug)]
-struct QwenImageAttentionConfig {
-    dim: usize,
-    heads: usize,
-    dim_head: usize,
-    eps: f64,
-}
-
-impl QwenImageAttentionConfig {
-    fn init(&self, device: &Device) -> QwenImageAttention {
-        let inner_dim = self.heads * self.dim_head;
-
-        QwenImageAttention {
-            to_q: LinearConfig::new(self.dim, inner_dim)
-                .with_bias(false)
-                .init(device),
-            to_k: LinearConfig::new(self.dim, inner_dim)
-                .with_bias(false)
-                .init(device),
-            to_v: LinearConfig::new(self.dim, inner_dim)
-                .with_bias(false)
-                .init(device),
-            to_out: vec![
-                LinearConfig::new(inner_dim, self.dim)
-                    .with_bias(false)
-                    .init(device),
-            ],
-            norm_q: RMSNormConfig::new(self.dim_head, self.eps).init(device),
-            norm_k: RMSNormConfig::new(self.dim_head, self.eps).init(device),
         }
-    }
-}
 
-#[derive(Module, Debug)]
-struct QwenImageTransformerBlock {
-    img_norm1: QwenLayerNorm,
-    attn: QwenImageAttention,
-    img_norm2: QwenLayerNorm,
-    img_mlp: QwenImageSwiGLUFeedForward,
-}
+        let image_ids = Tensor::<1, Int>::from_ints(image_ids_vec.as_slice(), device);
 
-impl QwenImageTransformerBlock {
-    fn modulate(
-        &self,
-        hidden_states: Tensor<3>,
-        mod_params: Tensor<2>,
-        target_token_mask: Option<Tensor<1, Bool>>,
-    ) -> (Tensor<3>, Tensor<3>) {
-        let mod_params = mod_params.chunk(2, 1);
-        let scale = mod_params[0].clone();
-        let gate = mod_params[1].clone();
-        let scale = select_modulation_rows(scale, target_token_mask.clone());
-        let gate = select_modulation_rows(gate, target_token_mask);
-        (hidden_states * (1.0 + scale), gate)
+        let target_token_mask_int: Vec<i64> = target_token_mask_vec
+            .iter()
+            .map(|&b| if b { 1 } else { 0 })
+            .collect();
+        let target_token_mask =
+            Tensor::<1, Int>::from_ints(target_token_mask_int.as_slice(), device).bool();
+
+        (image_ids, target_token_mask)
     }
 
-    fn forward(
+    pub fn forward(
         &self,
+        streamer: &mut QwenImageBlockStreamer,
         hidden_states: Tensor<3>,
-        modulation: Tensor<2>,
-        rotary_emb: (Tensor<2>, Tensor<2>),
-        attention_mask: Option<Tensor<4, Bool>>,
-        target_token_mask: Option<Tensor<1, Bool>>,
-        layer_cache: Option<&mut QwenImageKVLayerCache>,
+        encoder_hidden_states: Tensor<3>,
+        timestep: Tensor<1>,
+        img_shapes: Vec<(usize, usize, usize)>,
+        img_mask: Tensor<2, Bool>,
+        encoder_hidden_states_mask: Option<Tensor<2, Bool>>,
+        mut kv_cache: Option<&mut QwenImageKVCache>,
         kv_cache_mode: Option<KvCacheMode>,
-        prefix_len: usize,
-        segments: Option<Vec<(usize, usize, bool)>>,
-        key_valid: Option<Tensor<2, Bool>>,
     ) -> Tensor<3> {
-        let mods = modulation.chunk(2, 1);
-        let mod1 = mods[0].clone();
-        let mod2 = mods[1].clone();
+        let device = &hidden_states.device();
+        let [batch_size, _, dim] = encoder_hidden_states.dims();
 
-        let (img_modulated, img_gate1) = self.modulate(
-            self.img_norm1.forward(hidden_states.clone()),
-            mod1,
-            target_token_mask.clone(),
+        let hidden_states = self.img_in.forward(hidden_states);
+
+        let encoder_hidden_states = self.txt_in.forward(encoder_hidden_states);
+
+        let img_mask_bool = img_mask
+            .clone()
+            .slice(s![0..1, ..])
+            .into_data()
+            .iter::<bool>()
+            .collect::<Vec<bool>>();
+
+        let mut image_pad_mask_vec = Vec::new();
+        let mut repeat_indices = Vec::new();
+        for (i, &is_img) in img_mask_bool.iter().enumerate() {
+            if is_img {
+                for _ in 0..4 {
+                    image_pad_mask_vec.push(true);
+                    repeat_indices.push(i as i64);
+                }
+            } else {
+                image_pad_mask_vec.push(false);
+                repeat_indices.push(i as i64);
+            }
+        }
+
+        let mut joint_key_valid = None;
+        if let Some(enc_mask) = encoder_hidden_states_mask {
+            let [batch_size_mask, text_seq_len] = enc_mask.dims();
+            let enc_mask_vec = enc_mask.into_data().iter::<bool>().collect::<Vec<bool>>();
+            let joint_seq_len = image_pad_mask_vec.len();
+
+            let mut jkv_vec = vec![true; batch_size_mask * joint_seq_len];
+
+            let text_in_orig: Vec<usize> = img_mask_bool
+                .iter()
+                .enumerate()
+                .take(text_seq_len)
+                .filter(|x| !*x.1)
+                .map(|(i, _)| i)
+                .collect();
+
+            let text_in_joint: Vec<usize> = image_pad_mask_vec
+                .iter()
+                .enumerate()
+                .filter(|x| !*x.1)
+                .map(|(i, _)| i)
+                .collect();
+
+            for b in 0..batch_size_mask {
+                for (idx, &orig_i) in text_in_orig.iter().enumerate() {
+                    if idx < text_in_joint.len() {
+                        let joint_j = text_in_joint[idx];
+                        jkv_vec[b * joint_seq_len + joint_j] =
+                            enc_mask_vec[b * text_seq_len + orig_i];
+                    }
+                }
+            }
+
+            let jkv_ints: Vec<i64> = jkv_vec.into_iter().map(|b| if b { 1 } else { 0 }).collect();
+            joint_key_valid = Some(
+                Tensor::<1, Int>::from_ints(jkv_ints.as_slice(), device)
+                    .reshape([batch_size_mask, joint_seq_len])
+                    .bool(),
+            );
+        }
+
+        let target_shape = img_shapes.last().unwrap();
+        let target_tokens = target_shape.0 * target_shape.1 * target_shape.2;
+        let zeros = Tensor::<3>::zeros([batch_size, target_tokens / 4, dim], device);
+
+        let mut joint_hidden_states = Tensor::cat(vec![encoder_hidden_states, zeros], 1);
+
+        let repeat_indices_tensor = Tensor::<1, Int>::from_ints(repeat_indices.as_slice(), device);
+        joint_hidden_states = joint_hidden_states.select(1, repeat_indices_tensor);
+
+        let img_indices: Vec<i64> = image_pad_mask_vec
+            .iter()
+            .enumerate()
+            .filter(|x| *x.1)
+            .map(|(i, _)| i as i64)
+            .collect();
+
+        let img_indices_tensor = Tensor::<1, Int>::from_ints(img_indices.as_slice(), device)
+            .unsqueeze_dims::<3>(&[0, 2])
+            .repeat_dim(0, batch_size)
+            .repeat_dim(2, dim);
+
+        joint_hidden_states = joint_hidden_states.scatter(
+            1,
+            img_indices_tensor,
+            hidden_states,
+            IndexingUpdateOp::Assign,
         );
 
-        let attn_output = self.attn.forward(
-            img_modulated,
-            attention_mask,
-            rotary_emb,
-            layer_cache,
-            kv_cache_mode,
-            prefix_len,
-            segments,
-            key_valid,
-        );
+        let image_pad_mask_int: Vec<i64> = image_pad_mask_vec
+            .iter()
+            .map(|&b| if b { 1 } else { 0 })
+            .collect();
+        let image_pad_mask =
+            Tensor::<1, Int>::from_ints(image_pad_mask_int.as_slice(), device).bool();
 
-        let hidden_states = hidden_states.clone() + img_gate1.tanh() * attn_output;
+        let (image_ids, target_token_mask) =
+            Self::build_token_metadata(image_pad_mask.clone(), img_shapes.clone(), device);
 
-        let (img_modulated2, img_gate2) = self.modulate(
-            self.img_norm2.forward(hidden_states.clone()),
-            mod2,
-            target_token_mask,
-        );
+        let (cos, sin) = self.pos_embed.forward(img_shapes, image_pad_mask);
+        let mut rotary_emb = (cos, sin);
 
-        let hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp.forward(img_modulated2);
-        // ⚠️ Clamp to (-65504, 65504) when using F16
+        let t_zero = Tensor::<1>::zeros([1], device);
+        let timestep = Tensor::cat(vec![timestep, t_zero], 0);
+        let temb = self.time_text_embed.forward(timestep);
 
-        hidden_states
+        let modulation = self.modulation.1.forward(silu(temb.clone()));
+
+        let target_token_mask_vec = target_token_mask
+            .clone()
+            .into_data()
+            .iter::<bool>()
+            .collect::<Vec<bool>>();
+
+        let prefix_len = target_token_mask_vec.iter().filter(|&&b| !b).count();
+        let mut modulation_mask = target_token_mask.clone();
+
+        let mut segments = None;
+        let mut attention_mask = None;
+        let mut block_key_valid = joint_key_valid.clone();
+
+        if let Some(KvCacheMode::CACHED) = kv_cache_mode {
+            let seq_len = joint_hidden_states.dims()[1];
+            let rope_len = rotary_emb.0.dims()[0];
+            let rope_dim = rotary_emb.0.dims()[1];
+            let mask_len = modulation_mask.dims()[0];
+
+            joint_hidden_states =
+                joint_hidden_states.slice(s![0..batch_size, prefix_len..seq_len, 0..dim]);
+            rotary_emb = (
+                rotary_emb.0.slice(s![prefix_len..rope_len, 0..rope_dim]),
+                rotary_emb.1.slice(s![prefix_len..rope_len, 0..rope_dim]),
+            );
+            modulation_mask = modulation_mask.slice(s![prefix_len..mask_len]);
+
+            // Format mask for decode loop[cite: 3]
+            attention_mask = block_key_valid.map(|jkv| jkv.unsqueeze_dims::<4>(&[1, 2]));
+            block_key_valid = None;
+        } else {
+            segments = Some(qwenimage_prefix_segments(image_ids, prefix_len));
+        }
+
+        for i in 0..streamer.num_layers {
+            let layer_cache = kv_cache.as_deref_mut().map(|cache| cache.get_layer_mut(i));
+
+            joint_hidden_states = streamer.get(i).forward(
+                joint_hidden_states,
+                modulation.clone(),
+                rotary_emb.clone(),
+                attention_mask.clone(),
+                Some(modulation_mask.clone()),
+                layer_cache,
+                kv_cache_mode.clone(),
+                prefix_len,
+                segments.clone(),
+                block_key_valid.clone(),
+            );
+        }
+
+        joint_hidden_states = self
+            .norm_out
+            .forward(joint_hidden_states, temb, modulation_mask);
+
+        self.proj_out.forward(joint_hidden_states)
     }
 }
 
 #[derive(Config, Debug)]
-struct QwenImageTransformerBlockConfig {
-    dim: usize,
+pub struct QwenImageTransformerModelConfig {
+    #[config(default = 1)]
+    patch_size: usize,
+    #[config(default = 64)]
+    in_channels: usize,
+    #[config(default = 64)]
+    out_channels: usize,
     #[config(default = 32)]
-    num_attention_heads: usize,
+    num_layers: usize,
     #[config(default = 128)]
     attention_head_dim: usize,
+    #[config(default = 32)]
+    num_attention_heads: usize,
+    #[config(default = 4096)]
+    context_in_dim: usize,
     #[config(default = 3)]
     mlp_ratio: usize,
+    axes_dim_rope: [usize; 3],
     #[config(default = 1e-6)]
     eps: f64,
+    #[config(default = true)]
+    causal_condition: bool,
 }
 
-impl QwenImageTransformerBlockConfig {
-    fn init(&self, device: &Device) -> QwenImageTransformerBlock {
-        QwenImageTransformerBlock {
-            img_norm1: QwenLayerNormConfig::new(self.eps).init(),
-            attn: QwenImageAttentionConfig::new(
-                self.dim,
-                self.num_attention_heads,
-                self.attention_head_dim,
-                self.eps,
-            )
-            .init(device),
-            img_norm2: QwenLayerNormConfig::new(self.eps).init(),
-            img_mlp: QwenImageSwiGLUFeedForwardConfig::new(self.dim, self.dim * self.mlp_ratio)
+impl QwenImageTransformerModelConfig {
+    pub fn init(&self, device: &Device) -> QwenImageTransformerModel {
+        let inner_dim = self.num_attention_heads * self.attention_head_dim;
+        let transformer_blocks = vec![];
+        // for _ in 0..self.num_layers {
+        //     transformer_blocks.push(
+        //         QwenImageTransformerBlockConfig::new(
+        //             inner_dim,
+        //             self.num_attention_heads,
+        //             self.attention_head_dim,
+        //             self.mlp_ratio,
+        //             self.eps,
+        //         )
+        //         .init(device),
+        //     );
+        // }
+        QwenImageTransformerModel {
+            pos_embed: QwenImageRopeConfig::new(self.axes_dim_rope).init(device),
+            time_text_embed: QwenImageTimestepProjEmbeddingsConfig::new(inner_dim).init(device),
+            txt_in: QwenImageTextProjectionConfig::new(self.context_in_dim, inner_dim, self.eps)
                 .init(device),
-        }
-    }
-}
-
-#[derive(Module, Debug)]
-struct QwenImageRope {
-    freqs_cos_frame: Tensor<2>,
-    freqs_cos_height: Tensor<2>,
-    freqs_cos_width: Tensor<2>,
-    freqs_sin_frame: Tensor<2>,
-    freqs_sin_height: Tensor<2>,
-    freqs_sin_width: Tensor<2>,
-    total_dim: usize,
-}
-
-impl QwenImageRope {
-    fn forward(
-        &self,
-        img_shapes: Vec<(usize, usize, usize)>,
-        image_pad_mask: Tensor<1, Bool>,
-    ) -> (Tensor<2>, Tensor<2>) {
-        let device = &image_pad_mask.device();
-        let is_image_token = image_pad_mask.into_data().try_into_vec::<bool>().unwrap();
-        let total_len = is_image_token.len();
-
-        let mut frame_index = Vec::with_capacity(total_len);
-        let mut image_height_index = Vec::new();
-        let mut image_width_index = Vec::new();
-
-        let mut cursor = 0;
-        let mut position = 0;
-
-        for (_frame, height, width) in img_shapes {
-            let block_start = is_image_token[cursor..].iter().position(|&x| x).unwrap() + cursor;
-            let text_len = block_start - cursor;
-
-            for p in position..position + text_len {
-                frame_index.push(p as i64);
-            }
-            position += text_len;
-
-            cursor = block_start + height * width;
-            for _ in 0..height * width {
-                frame_index.push(position as i64);
-            }
-
-            position += height.max(width);
-
-            let half_h = (height as i64) / 2;
-            let half_w = (width as i64) / 2;
-
-            for h in -(height as i64 - half_h)..half_h {
-                for _ in 0..width {
-                    image_height_index.push(h);
-                }
-            }
-            for _ in 0..height {
-                for w in -(width as i64 - half_w)..half_w {
-                    image_width_index.push(w);
-                }
-            }
-        }
-
-        if cursor < total_len {
-            for p in position..(position + total_len - cursor) {
-                frame_index.push(p as i64);
-            }
-        }
-
-        let mut final_height_index = frame_index.clone();
-        let mut final_width_index = frame_index.clone();
-
-        let mut img_idx = 0;
-        for (i, &is_img) in is_image_token.iter().enumerate() {
-            if is_img {
-                final_height_index[i] = image_height_index[img_idx];
-                final_width_index[i] = image_width_index[img_idx];
-                img_idx += 1;
-            }
-        }
-
-        let map_idx = |idx: i64| if idx < 0 { 9216 + idx } else { idx };
-
-        let frame_mapped: Vec<i64> = frame_index.into_iter().map(map_idx).collect();
-        let height_mapped: Vec<i64> = final_height_index.into_iter().map(map_idx).collect();
-        let width_mapped: Vec<i64> = final_width_index.into_iter().map(map_idx).collect();
-
-        let frame_tensor = Tensor::<1, Int>::from_ints(frame_mapped.as_slice(), device);
-        let height_tensor = Tensor::<1, Int>::from_ints(height_mapped.as_slice(), device);
-        let width_tensor = Tensor::<1, Int>::from_ints(width_mapped.as_slice(), device);
-
-        let cos_f = self.freqs_cos_frame.clone().select(0, frame_tensor.clone());
-        let sin_f = self.freqs_sin_frame.clone().select(0, frame_tensor);
-
-        let cos_h = self
-            .freqs_cos_height
-            .clone()
-            .select(0, height_tensor.clone());
-        let sin_h = self.freqs_sin_height.clone().select(0, height_tensor);
-
-        let cos_w = self.freqs_cos_width.clone().select(0, width_tensor.clone());
-        let sin_w = self.freqs_sin_width.clone().select(0, width_tensor);
-
-        let cos = Tensor::cat(vec![cos_f, cos_h, cos_w], 1);
-        let sin = Tensor::cat(vec![sin_f, sin_h, sin_w], 1);
-
-        let cos =
-            Tensor::stack::<3>(vec![cos.clone(), cos], 2).reshape([total_len, self.total_dim]);
-        let sin =
-            Tensor::stack::<3>(vec![sin.clone(), sin], 2).reshape([total_len, self.total_dim]);
-
-        (cos, sin)
-    }
-}
-
-#[derive(Config, Debug)]
-struct QwenImageRopeConfig {
-    #[config(default = 10_000)]
-    theta: usize,
-    axes_dim: [usize; 3],
-}
-
-impl QwenImageRopeConfig {
-    fn init(&self, device: &Device) -> QwenImageRope {
-        let pos_index = Tensor::<1, Int>::arange(0..8192, device).cast(FloatDType::F32);
-        let neg_index = Tensor::<1, Int>::arange(-1024..0, device).cast(FloatDType::F32);
-
-        let index = Tensor::cat(vec![pos_index, neg_index], 0); // (9216,)
-        let index_unsqueezed = index.unsqueeze_dim::<2>(1); // (9216, 1)
-
-        let mut cos_tensors = vec![];
-        let mut sin_tensors = vec![];
-
-        let theta_ln = (self.theta as f64).ln();
-
-        for &dim in self.axes_dim.iter() {
-            let dim_f32 = dim as f32;
-            let arange =
-                Tensor::<1, Int>::arange_step(0..dim as i64, 2, device).cast(FloatDType::F32);
-            let inv_freq = (arange / dim_f32 * -theta_ln).exp();
-            let inv_freq_unsqueezed = inv_freq.unsqueeze_dim::<2>(0); // (1, dim/2)
-
-            let freqs = index_unsqueezed.clone() * inv_freq_unsqueezed;
-
-            cos_tensors.push(freqs.clone().cos());
-            sin_tensors.push(freqs.sin());
-        }
-
-        let total_dim = self.axes_dim.iter().sum();
-
-        QwenImageRope {
-            freqs_cos_frame: cos_tensors[0].clone(),
-            freqs_cos_height: cos_tensors[1].clone(),
-            freqs_cos_width: cos_tensors[2].clone(),
-            freqs_sin_frame: sin_tensors[0].clone(),
-            freqs_sin_height: sin_tensors[1].clone(),
-            freqs_sin_width: sin_tensors[2].clone(),
-            total_dim,
+            img_in: LinearConfig::new(
+                self.in_channels * self.patch_size * self.patch_size,
+                inner_dim,
+            )
+            .with_bias(false)
+            .init(device),
+            modulation: (
+                DummyModule {},
+                LinearConfig::new(inner_dim, 4 * inner_dim)
+                    .with_bias(false)
+                    .init(device),
+            ),
+            transformer_blocks,
+            norm_out: QwenImageAdaLayerNormContinuousConfig::new(inner_dim, inner_dim, self.eps)
+                .init(device),
+            proj_out: LinearConfig::new(
+                inner_dim,
+                self.patch_size * self.patch_size * self.out_channels,
+            )
+            .with_bias(false)
+            .init(device),
         }
     }
 }

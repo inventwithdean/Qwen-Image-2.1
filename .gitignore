@@ -1,2 +1,6 @@
 /target
 /reference
+/vae
+/out
+prompt_embeds.bin
+latents_out.bin
