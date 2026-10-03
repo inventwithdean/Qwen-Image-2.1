@@ -318,60 +318,6 @@ impl QwenImageAdaLayerNormContinuousConfig {
     }
 }
 
-const FLEX_BLOCK_SIZE: usize = 128;
-
-fn build_qwenimage_block_causal_mask(
-    mut image_ids: Tensor<1, Int>,
-    encoder_hidden_states_mask: Option<Tensor<2, Bool>>,
-    batch_size: usize,
-) -> Tensor<4, Bool> {
-    // image_ids: (seq_len,)
-    // encoder_hidden_states_mask: (batch_size, seq_len)
-    let device = &image_ids.device();
-
-    let seq_len = image_ids.dims()[0];
-    let padded_seq_len =
-        ((seq_len as f64 / FLEX_BLOCK_SIZE as f64).ceil() * FLEX_BLOCK_SIZE as f64) as usize;
-    let padding_len = padded_seq_len - seq_len;
-    if padding_len > 0 {
-        let pad_tensor = Tensor::<1, Int>::full([padding_len], -1, device);
-        image_ids = Tensor::cat(vec![image_ids, pad_tensor], 0);
-    }
-    let key_valid = if let Some(encoder_hidden_states_mask) = encoder_hidden_states_mask {
-        let pad_tensor = Tensor::<2, Bool>::full([batch_size, padding_len], false, device);
-        Tensor::cat(vec![encoder_hidden_states_mask, pad_tensor], 1)
-    } else {
-        Tensor::<2>::ones([batch_size, padded_seq_len], device).bool()
-    };
-
-    let idxs = Tensor::<1, Int>::arange(0..padded_seq_len as i64, device);
-    let q_idx = idxs.clone().unsqueeze_dim::<2>(1); // (padded_seq_len, 1)
-    let kv_idx = idxs.unsqueeze_dim::<2>(0); // (1, padded_seq_len)
-
-    let q_image_id = image_ids.clone().unsqueeze_dim::<2>(1); // (padded_seq_len, 1)
-    let kv_image_id = image_ids.unsqueeze_dim::<2>(0); // (1, padded_seq_len)
-    let same_image_block = q_image_id
-        .clone()
-        .equal(kv_image_id)
-        .bool_and(q_image_id.greater_equal_elem(0));
-
-    let causal = q_idx.clone().greater_equal(kv_idx.clone());
-
-    let allowed_spatial = causal.bool_or(same_image_block);
-
-    let q_not_pad = q_idx.lower_elem(seq_len as i64);
-    let kv_not_pad = kv_idx.lower_elem(seq_len as i64);
-    let not_padding = q_not_pad.bool_and(kv_not_pad);
-
-    let base_mask = allowed_spatial.bool_and(not_padding);
-
-    let base_mask = base_mask.unsqueeze_dims::<4>(&[0, 1]); // (1, 1, padded_seq_len, padded_seq_len)
-    let key_valid_broadcast = key_valid.unsqueeze_dims::<4>(&[1, 2]); // (batch_size, 1, 1, padded_seq_len)
-
-    let final_mask = base_mask.bool_and(key_valid_broadcast);
-    final_mask
-}
-
 fn qwenimage_prefix_segments(
     image_ids: Tensor<1, Int>,
     prefix_len: usize,
@@ -390,18 +336,162 @@ fn qwenimage_prefix_segments(
     segments
 }
 
+/// Stores the K and V projecctions (post-RoPE) for the prefix extracted at the first denoising step.
+/// K and V both are of shape: (batch_size, num_prefix_tokens, num_heads, head_dim)
+#[derive(Clone)]
+struct QwenImageKVLayerCache {
+    k: Tensor<4>,
+    v: Tensor<4>,
+}
+
+impl QwenImageKVLayerCache {
+    fn store(&mut self, k: Tensor<4>, v: Tensor<4>) {
+        self.k = k;
+        self.v = v;
+    }
+
+    fn get(&self) -> (Tensor<4>, Tensor<4>) {
+        (self.k.clone(), self.v.clone())
+    }
+}
+
+struct QwenImageKVCache {
+    layer_caches: Vec<QwenImageKVLayerCache>,
+}
+
+impl QwenImageKVCache {
+    fn get_layer(&self, layer_idx: usize) -> QwenImageKVLayerCache {
+        self.layer_caches[layer_idx].clone()
+    }
+}
+
+enum KvCacheMode {
+    EXTRACT,
+    CACHED,
+}
+
 #[derive(Module, Debug)]
 struct QwenImageAttention {
     to_q: Linear,
     to_k: Linear,
     to_v: Linear,
-    to_out: Vec<Linear>, // (Original ModuleList is [Linear, Dropout] but dropout isn't used in training and we need the name mapping to work, so using Vec<Linear>)
+    to_out: Vec<Linear>, // (Original ModuleList was [Linear, Dropout] but dropout isn't used in inference and we need the name mapping to work, so using Vec<Linear>)
     norm_q: RMSNorm,
     norm_k: RMSNorm,
 }
 
+fn attention(
+    query: Tensor<4>,
+    key: Tensor<4>,
+    value: Tensor<4>,
+    attention_mask: Option<Tensor<4, Bool>>,
+) -> Tensor<4> {
+    Tensor::zeros([3, 3, 3, 3], &query.device())
+}
+
 impl QwenImageAttention {
-    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
-        
+    fn forward(
+        &self,
+        hidden_states: Tensor<3>,
+        attention_mask: Option<Tensor<4, Bool>>,
+        rotary_emb: (Tensor<2>, Tensor<2>),
+        layer_cache: Option<&mut QwenImageKVLayerCache>,
+        kv_cache_mode: Option<KvCacheMode>,
+        prefix_len: usize,
+        segments: Option<Vec<(usize, usize, bool)>>,
+        key_valid: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
+        let num_attention_heads = 32;
+        let head_dim = 128;
+        let [b, s, _] = hidden_states.dims();
+        let query = self.to_q.forward(hidden_states.clone()); // (B, S, 4096)
+        let key = self.to_k.forward(hidden_states.clone()); // (B, S, 4096)
+        let value = self.to_v.forward(hidden_states.clone()); // (B, S, 4096)
+
+        let mut query = query.reshape([b, s, num_attention_heads, head_dim]);
+        let mut key = key.reshape([b, s, num_attention_heads, head_dim]);
+        let mut value = value.reshape([b, s, num_attention_heads, head_dim]);
+        // All are of shape (B, S, 32, 128) now
+
+        query = self.norm_q.forward(query);
+        key = self.norm_k.forward(key);
+
+        query = apply_rotary_emb_qwen(query, rotary_emb.clone());
+        key = apply_rotary_emb_qwen(key, rotary_emb);
+        if let (Some(layer_cache), Some(kv_cache_mode)) = (layer_cache, kv_cache_mode) {
+            match kv_cache_mode {
+                KvCacheMode::EXTRACT => {
+                    layer_cache.store(
+                        key.clone().slice(s![.., ..prefix_len, .., ..]),
+                        value.clone().slice(s![.., ..prefix_len, .., ..]),
+                    );
+                }
+                KvCacheMode::CACHED => {
+                    let (cached_k, cached_v) = layer_cache.get();
+                    key = Tensor::cat(vec![cached_k, key], 1);
+                    value = Tensor::cat(vec![cached_v, value], 1);
+                }
+            }
+        }
+        let seq_len_q = query.dims()[1];
+        let seq_len_kv = key.dims()[1];
+
+        let hidden_states = if let Some(segments) = segments {
+            let prefix_len = segments.last().unwrap().1;
+            let mut outputs = vec![];
+            for (start, end, is_text) in segments {
+                let mut seg_mask = None;
+                if is_text {
+                    let seg_len = end - start;
+                    // (1, 1, seg_len, end)
+                    seg_mask = Some(
+                        Tensor::cat(
+                            vec![
+                                Tensor::<2, Int>::ones([seg_len, start], &query.device()).bool(),
+                                Tensor::<2, Int>::ones([seg_len, seg_len], &query.device())
+                                    .tril(0)
+                                    .bool(),
+                            ],
+                            1,
+                        )
+                        .unsqueeze_dims::<4>(&[0, 1]),
+                    );
+                }
+                if let Some(key_valid) = key_valid.clone() {
+                    let mut seg_key_valid = key_valid.unsqueeze_dims::<4>(&[1, 2]); // (B, 1, 1, S)
+                    seg_key_valid = seg_key_valid.slice(s![.., .., .., 0..end]);
+                    seg_mask = match seg_mask {
+                        Some(mask) => Some(mask.bool_and(seg_key_valid)),
+                        None => Some(seg_key_valid),
+                    }
+                }
+
+                outputs.push(attention(
+                    query.clone().slice(s![.., start..end, .., ..]),
+                    key.clone().slice(s![.., 0..end, .., ..]),
+                    value.clone().slice(s![.., 0..end, .., ..]),
+                    seg_mask,
+                ));
+            }
+            // (B, 1, 1, S)
+            let trailing_mask = key_valid.map(|kv| kv.unsqueeze_dims::<4>(&[1, 2]));
+            outputs.push(attention(
+                query.slice(s![.., prefix_len.., .., ..]),
+                key,
+                value,
+                trailing_mask,
+            ));
+
+            let prefill_hidden_states = Tensor::cat(outputs, 1);
+            prefill_hidden_states.slice(s![.., 0..seq_len_q, .., ..]) // (B, S, 32, 128)
+        } else {
+            let decode_hidden_states = attention(query, key, value, attention_mask);
+            decode_hidden_states.slice(s![.., 0..seq_len_q, .., ..])
+        };
+
+        let hidden_states = hidden_states.reshape([b, seq_len_q, num_attention_heads * head_dim]);
+        let hidden_states = self.to_out[0].forward(hidden_states);
+
+        hidden_states
     }
 }
