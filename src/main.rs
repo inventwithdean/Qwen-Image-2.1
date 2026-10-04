@@ -67,7 +67,7 @@ fn main() {
     let t_text = prompt_floats.len() / 4096;
     
     // Generation Config
-    let (h, w) = (64_usize, 64_usize);
+    let (h, w) = (48_usize, 48_usize);
     let batch_size = 1;
 
     let target_tokens = h * w;
