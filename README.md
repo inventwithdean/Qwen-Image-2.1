@@ -38,7 +38,7 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 ## Flash Attention
 Flash attention doesn't require materializing full N x N matrix hence saving us a lot of VRAM.
 
-#### 1024x1024 Image generated utilizing only ~5GB VRAM.
+#### 1024x1024 Image generated utilizing only ~5.2GB peak VRAM.
 ![A sample 1024x1024 image generated](./generations/sample_06.png)
 
 
