@@ -2,16 +2,12 @@ use std::{path::Path, time::Instant};
 
 use burn::{
     Tensor,
-    backend::wgpu::WgpuDevice,
-    module::{Module, Quantizer},
+    backend::CudaDevice,
+    module::Module,
     store::ModuleRecord,
-    tensor::{
-        Device, Distribution, FloatDType, Int,
-        quantization::{Calibration, QuantScheme, ScaleDtype},
-        s,
-    },
+    tensor::{Device, Distribution, FloatDType, Int, IntDType, s},
 };
-use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+use burn_store::{BurnpackStore, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 use qwen_image::{
     qwen_image::{QwenImageBlockStreamer, QwenImageTransformerModelConfig},
     qwen_image_modules::{KvCacheMode, QwenImageKVCache, QwenImageTransformerBlockConfig},
@@ -50,38 +46,55 @@ fn schedule(steps: usize, seq_len: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let device: Device = WgpuDevice::default().into();
+    let mut device: Device = CudaDevice::default().into();
+    match device.supports_dtype(FloatDType::BF16) {
+        true => println!("Supports BF16"),
+        false => println!("Doesn't support BF16"),
+    }
 
+    device.configure((FloatDType::BF16, IntDType::I32)).unwrap();
     let config = QwenImageTransformerModelConfig::new([16, 56, 56]);
 
-    let record = ModuleRecord::load("out/shell.mpk").expect("shell");
-    let model = config.init(&device).load_record(record);
-    let mut streamer = QwenImageBlockStreamer::new("out", &config, &device);
+    let src = "./out";
+    // Don't load layers, we'll stream them from RAM
+    let mut model = config.clone().with_num_layers(0).init(&device);
+    let shell_record = ModuleRecord::load(Path::new(src).join("shell.bpk")).unwrap();
+    model = model.load_record(shell_record);
+
+    let mut streamer = QwenImageBlockStreamer::new(src, &config, &device);
 
     let prompt_floats: Vec<f32> = read_f32("prompt_embeds.bin");
     let t_text = prompt_floats.len() / 4096;
-    let (h, w) = (32_usize, 32_usize);
+    
+    // Generation Config
+    let (h, w) = (56_usize, 56_usize);
+    let batch_size = 1;
+
     let target_tokens = h * w;
     let slots = target_tokens / 4;
     let img_shapes = vec![(1, h, w)];
     let encoder_hidden_states =
         Tensor::<1>::from_floats(prompt_floats.as_slice(), &device).reshape([1, t_text, 4096]);
 
+    let encoder_hidden_states = encoder_hidden_states.repeat_dim(0, batch_size);
+
     let mut latents = Tensor::<3>::random(
-        [1, target_tokens, 64],
+        [batch_size, target_tokens, 64],
         Distribution::Normal(0.0, 1.0),
         &device,
-    );
+    )
+    .cast(FloatDType::F32);
 
     let mask_ints: Vec<i64> = (0..t_text + slots).map(|i| (i >= t_text) as i64).collect();
     let img_mask = Tensor::<1, Int>::from_ints(mask_ints.as_slice(), &device)
         .reshape([1, t_text + slots])
         .bool();
+    let img_mask = img_mask.repeat_dim(0, batch_size);
 
     let steps = 25;
     let sigmas: Vec<f32> = schedule(steps, target_tokens);
 
-    let mut kv_cache = QwenImageKVCache::new(streamer.num_layers, &device);
+    let mut kv_cache = QwenImageKVCache::new(streamer.num_layers, batch_size, &device);
 
     let total = Instant::now();
     for step in 0..steps {
@@ -96,7 +109,7 @@ fn main() {
 
         let out = model.forward(
             &mut streamer,
-            latents.clone(),
+            latents.clone().cast(FloatDType::BF16),
             encoder_hidden_states.clone(),
             timestep,
             img_shapes.clone(),
@@ -107,12 +120,13 @@ fn main() {
         );
 
         let n = out.dims()[1];
-        let pred = out.slice(s![.., n - target_tokens..n, ..]);
+        let pred = out
+            .slice(s![.., n - target_tokens..n, ..])
+            .cast(FloatDType::F32);
 
         // Euler step
         latents = latents + pred * (sigmas[step + 1] - sigmas[step]);
 
-        // Readback forces a sync so the timing is real
         let _ = latents.clone().sum_dim(0).sum_dim(1).sum_dim(2).into_data();
         let sample = latents
             .clone()
@@ -143,65 +157,48 @@ fn main() {
     println!("Saved latents_out.bin.");
 }
 
-// Converts from F32 to INT8 blocks for ram/disk offloading
-fn _convert_qwen() {
+fn _convert_to_bpk() {
+    let device: Device = CudaDevice::default().into();
+
     const SHARDS: [&str; 2] = [
         "diffusion_pytorch_model-00001-of-00002.safetensors",
         "diffusion_pytorch_model-00002-of-00002.safetensors",
     ];
     const NUM_LAYERS: usize = 32;
-    let src = "./weights_f32";
+
+    let src = "./weights/transformer";
     let out = Path::new("out");
     std::fs::create_dir_all(out).unwrap();
-    let device: Device = WgpuDevice::default().into();
-    let mut quantizer = Quantizer::new(
-        Calibration::MinMax,
-        QuantScheme::default().per_tensor(ScaleDtype::F32),
-    );
 
-    {
-        let mut shell = QwenImageTransformerModelConfig::new([16, 56, 56])
-            .with_num_layers(0)
-            .init(&device);
+    let mut shell = QwenImageTransformerModelConfig::new([16, 56, 56])
+        .with_num_layers(0)
+        .init(&device);
 
-        for shard in SHARDS {
-            let mut store = SafetensorsStore::from_file(Path::new(&src).join(shard))
-                .with_from_adapter(PyTorchToBurnAdapter)
-                .allow_partial(true);
-            let r = shell.load_from(&mut store).unwrap();
-            println!(
-                "shell <- {shard}: applied {}, errors {:?}",
-                r.applied.len(),
-                r.errors
-            );
-        }
-        shell
-            .into_record()
-            .save(out.join("shell.mpk"))
-            .expect("save shell");
+    for shard in SHARDS {
+        let mut store = SafetensorsStore::from_file(Path::new(src).join(shard))
+            .with_from_adapter(PyTorchToBurnAdapter)
+            .allow_partial(true);
+        shell.load_from(&mut store).unwrap();
     }
 
-    for i in 0..NUM_LAYERS {
-        let mut block = QwenImageTransformerBlockConfig::new(4096, 32, 128, 3, 1e-6).init(&device);
+    let mut out_store = BurnpackStore::from_file(out.join("shell.bpk"));
+    shell.save_into(&mut out_store).unwrap();
+    println!("saved out/shell.bpk");
 
+    let inner_dim = 32 * 128;
+    let block_config = QwenImageTransformerBlockConfig::new(inner_dim, 32, 128, 3, 1e-6);
+
+    for i in 0..NUM_LAYERS {
+        let mut block = block_config.init(&device);
         for shard in SHARDS {
-            let mut store = SafetensorsStore::from_file(Path::new(&src).join(shard))
+            let mut store = SafetensorsStore::from_file(Path::new(src).join(shard))
                 .with_from_adapter(PyTorchToBurnAdapter)
                 .with_key_remapping(&format!(r"^transformer_blocks\.{i}\."), "")
                 .allow_partial(true);
-            let r = block.load_from(&mut store).unwrap();
-            println!(
-                "block {i} <- {shard}: applied {}, errors {:?}",
-                r.applied.len(),
-                r.errors
-            );
+            block.load_from(&mut store).unwrap();
         }
-
-        let block = block.quantize_weights(&mut quantizer);
-        block
-            .into_record()
-            .save(out.join(format!("block_{i}.mpk")))
-            .expect("save block");
-        println!("saved block_{i}.mpk");
+        let mut out_store = BurnpackStore::from_file(out.join(format!("block_{i}.bpk")));
+        block.save_into(&mut out_store).unwrap();
+        println!("saved out/block_{i}.bpk");
     }
 }

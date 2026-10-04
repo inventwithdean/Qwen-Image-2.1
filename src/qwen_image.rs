@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, time::Instant};
+use std::{path::PathBuf, thread, time::Instant};
 
 use burn::{
     Tensor,
@@ -6,7 +6,7 @@ use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
     store::ModuleRecord,
-    tensor::{Bool, Bytes, Device, IndexingUpdateOp, Int, activation::silu, s},
+    tensor::{Bool, Device, IndexingUpdateOp, Int, activation::silu, s},
 };
 
 use crate::qwen_image_modules::{
@@ -25,11 +25,11 @@ pub struct QwenImageBlockStreamer {
 
 impl QwenImageBlockStreamer {
     pub fn new(
-        dir: impl Into<PathBuf>,
+        src: impl Into<PathBuf>,
         config: &QwenImageTransformerModelConfig,
         device: &Device,
     ) -> Self {
-        let dir_path = dir.into();
+        let src_path = src.into();
         let inner_dim = config.num_attention_heads * config.attention_head_dim;
         let block_config = QwenImageTransformerBlockConfig::new(
             inner_dim,
@@ -38,20 +38,40 @@ impl QwenImageBlockStreamer {
             config.mlp_ratio,
             config.eps,
         );
-        let mut records = Vec::with_capacity(config.num_layers);
-        println!("Loading {} layers into System RAM...", config.num_layers);
+
+        println!("Loading {} layers into RAM...", config.num_layers);
 
         let start = Instant::now();
-        for layer in 0..config.num_layers {
-            let path = dir_path.join(format!("block_{layer}.mpk"));
-            let bytes = fs::read(&path).expect("Failed to read block file");
-            let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(bytes)).unwrap();
-            records.push(record);
-        }
+        let mut records_opt: Vec<Option<ModuleRecord>> =
+            (0..config.num_layers).map(|_| None).collect();
+        let mid = config.num_layers / 2; // 16
+        thread::scope(|s| {
+            let (first_half, second_half) = records_opt.split_at_mut(mid);
+            let path_ref = &src_path;
+
+            s.spawn(move || {
+                for (idx, slot) in first_half.iter_mut().enumerate() {
+                    let layer = idx;
+                    let bpk_path = path_ref.join(format!("block_{layer}.bpk"));
+                    let record = ModuleRecord::load(&bpk_path).unwrap();
+                    *slot = Some(ModuleRecord::from_bytes(record.into_bytes().unwrap()).unwrap());
+                }
+            });
+            s.spawn(move || {
+                for (idx, slot) in second_half.iter_mut().enumerate() {
+                    let layer = mid + idx;
+                    let bpk_path = path_ref.join(format!("block_{layer}.bpk"));
+                    let record = ModuleRecord::load(&bpk_path).unwrap();
+                    *slot = Some(ModuleRecord::from_bytes(record.into_bytes().unwrap()).unwrap());
+                }
+            });
+        });
+
+        let records: Vec<ModuleRecord> = records_opt.into_iter().map(Option::unwrap).collect();
+        println!("Loaded in {:.2?}", start.elapsed());
 
         let active_block = block_config.init(device);
 
-        println!("Loaded in {:.2?}", start.elapsed());
         Self {
             num_layers: config.num_layers,
             records,
@@ -66,6 +86,7 @@ impl QwenImageBlockStreamer {
             .active_block
             .take()
             .expect("Active block not initialized");
+
         let updated_block = block.load_record(record);
         self.active_block = Some(updated_block);
         self.active_block.as_ref().unwrap()
@@ -115,7 +136,6 @@ impl QwenImageTransformerModel {
                     sum += len;
                     if img_token_idx < sum {
                         image_ids_vec[i] = b as i64;
-                        // The last block is always the target image
                         if b == block_lengths.len() - 1 {
                             target_token_mask_vec[i] = true;
                         }
@@ -293,7 +313,6 @@ impl QwenImageTransformerModel {
             );
             modulation_mask = modulation_mask.slice(s![prefix_len..mask_len]);
 
-            // Format mask for decode loop[cite: 3]
             attention_mask = block_key_valid.map(|jkv| jkv.unsqueeze_dims::<4>(&[1, 2]));
             block_key_valid = None;
         } else {
@@ -321,7 +340,8 @@ impl QwenImageTransformerModel {
             .norm_out
             .forward(joint_hidden_states, temb, modulation_mask);
 
-        self.proj_out.forward(joint_hidden_states)
+        let out = self.proj_out.forward(joint_hidden_states);
+        out
     }
 }
 
@@ -353,19 +373,19 @@ pub struct QwenImageTransformerModelConfig {
 impl QwenImageTransformerModelConfig {
     pub fn init(&self, device: &Device) -> QwenImageTransformerModel {
         let inner_dim = self.num_attention_heads * self.attention_head_dim;
-        let transformer_blocks = vec![];
-        // for _ in 0..self.num_layers {
-        //     transformer_blocks.push(
-        //         QwenImageTransformerBlockConfig::new(
-        //             inner_dim,
-        //             self.num_attention_heads,
-        //             self.attention_head_dim,
-        //             self.mlp_ratio,
-        //             self.eps,
-        //         )
-        //         .init(device),
-        //     );
-        // }
+        let mut transformer_blocks = vec![];
+        for _ in 0..self.num_layers {
+            transformer_blocks.push(
+                QwenImageTransformerBlockConfig::new(
+                    inner_dim,
+                    self.num_attention_heads,
+                    self.attention_head_dim,
+                    self.mlp_ratio,
+                    self.eps,
+                )
+                .init(device),
+            );
+        }
         QwenImageTransformerModel {
             pos_embed: QwenImageRopeConfig::new(self.axes_dim_rope).init(device),
             time_text_embed: QwenImageTimestepProjEmbeddingsConfig::new(inner_dim).init(device),

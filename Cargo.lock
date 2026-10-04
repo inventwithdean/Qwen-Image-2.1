@@ -4650,6 +4650,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-store",
+ "cubecl",
  "safetensors 0.8.0",
  "serde",
  "serde_json",

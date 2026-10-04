@@ -4,7 +4,7 @@ use burn::{
     module::{Module, Param},
     nn::{Linear, LinearConfig},
     tensor::{
-        Bool, DType, Device, FloatDType, Int,
+        Bool, Device, FloatDType, Int,
         activation::{gelu_approximate, silu, softmax},
         s,
     },
@@ -17,7 +17,8 @@ fn apply_rotary_emb_qwen(x: Tensor<4>, freqs_cis: (Tensor<2>, Tensor<2>)) -> Ten
     // x: (Batch, Sequence, Heads, Dimension)
     // cos: (S, D)
     // sin: (S, D)
-
+    let initial_dtype = x.dtype();
+    let x = x.cast(FloatDType::F32);
     let [b, s, h, d] = x.dims();
     let (cos, sin) = freqs_cis;
     let cos = cos.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(2); // (1, S, D) then (1, S, 1, D)
@@ -29,7 +30,8 @@ fn apply_rotary_emb_qwen(x: Tensor<4>, freqs_cis: (Tensor<2>, Tensor<2>)) -> Ten
     let x_rotated = Tensor::stack::<5>(vec![-x_imag, x_real], 4); // (B, S, H, D/2, 2)
     let x_rotated = x_rotated.reshape([b, s, h, d]);
 
-    x * cos + x_rotated * sin // (B, S, H, D)
+    let out = x * cos + x_rotated * sin; // (B, S, H, D)
+    out.cast(initial_dtype)
 }
 
 // timestep_dim = 256
@@ -45,13 +47,15 @@ struct QwenImageTemporalTimesteps {
 impl QwenImageTemporalTimesteps {
     fn forward(&self, timestep: Tensor<1>) -> Tensor<2> {
         // timestep: (B,)
-        let timestep = self.time_factor * timestep;
+        let initial_dtype = timestep.dtype();
+        let timestep = (self.time_factor * timestep).cast(FloatDType::F32);
         let timestep = timestep.unsqueeze_dim::<2>(1); // (B, 1)
         let freqs = self.freqs.clone().unsqueeze_dim::<2>(0); // (1, half)
         let args = timestep * freqs;
         let cos = args.clone().cos(); // (B, half)
         let sin = args.clone().sin(); // (B, half)
-        Tensor::cat(vec![cos, sin], 1) // (B, timestep_dim) as half * 2 = timestep_dim
+        let out = Tensor::cat(vec![cos, sin], 1); // (B, timestep_dim) as half * 2 = timestep_dim
+        out.cast(initial_dtype)
     }
 }
 
@@ -157,16 +161,20 @@ impl QwenImageZeroCenterRMSNorm {
     fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
         // hidden_states: (B, S, D)
 
+        let initial_dtype = hidden_states.dtype();
+        let hidden_states = hidden_states.cast(FloatDType::F32);
         let arg = hidden_states.clone().powf_scalar(2.0).mean_dim(2) + self.eps;
         let rrms = arg.sqrt().recip();
 
         let weight = self
             .weight
             .val()
+            .cast(FloatDType::F32)
             .unsqueeze_dim::<2>(0)
             .unsqueeze_dim::<3>(0)
             + 1.0; // (1, dim)
-        hidden_states * rrms * weight
+        let out = hidden_states * rrms * weight;
+        out.cast(initial_dtype)
     }
 }
 
@@ -269,10 +277,13 @@ struct QwenLayerNorm {
 impl QwenLayerNorm {
     fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
         // hidden_states: (B, S, D)
+        let initial_dtype = hidden_states.dtype();
+        let hidden_states = hidden_states.cast(FloatDType::F32);
         let mean = hidden_states.clone().mean_dim(2); // (B, S, 1)
         let diff = hidden_states.clone() - mean; // (B, S, D)
         let var = diff.clone().powf_scalar(2.0).mean_dim(2); // (B, S, 1)
-        diff / (var + self.eps).sqrt() // (B, S, D)
+        let out = diff / (var + self.eps).sqrt(); // (B, S, D)
+        out.cast(initial_dtype)
     }
 }
 
@@ -304,12 +315,12 @@ impl QwenImageAdaLayerNormContinuous {
         // hidden_states: (B, S, D)
         // conditioning_embedding: (B+1, D)
         // target_token_mask: (S)
-
         let normalized_hidden_states = self.norm.forward(hidden_states); // (B, S, D)
 
         let scale = self.linear.forward(silu(conditioning_embedding));
         let scale = select_modulation_rows(scale, Some(target_token_mask));
-        normalized_hidden_states * (1.0 + scale)
+        let out: Tensor<3> = normalized_hidden_states * (1.0 + scale);
+        out
     }
 }
 
@@ -392,11 +403,11 @@ pub struct QwenImageKVCache {
 }
 
 impl QwenImageKVCache {
-    pub fn new(num_layers: usize, device: &Device) -> Self {
+    pub fn new(num_layers: usize, batch_size: usize, device: &Device) -> Self {
         let layer_caches = (0..num_layers)
             .map(|_| QwenImageKVLayerCache {
-                k: Tensor::zeros([1, 1, 32, 128], device),
-                v: Tensor::zeros([1, 1, 32, 128], device),
+                k: Tensor::zeros([batch_size, 1, 32, 128], device),
+                v: Tensor::zeros([batch_size, 1, 32, 128], device),
             })
             .collect();
         Self { layer_caches }
@@ -433,6 +444,11 @@ fn attention(
     let key = key.swap_dims(1, 2); // (B, H, S, D)
     let value = value.swap_dims(1, 2); // (B, H, S, D)
 
+    let initial_dtype = query.dtype();
+    let query = query.cast(FloatDType::F32);
+    let key = key.cast(FloatDType::F32);
+    let value = value.cast(FloatDType::F32);
+
     let head_dim = query.dims()[3] as f64;
     let scale = 1.0 / head_dim.sqrt();
 
@@ -441,13 +457,18 @@ fn attention(
     let mut scores = query.matmul(key.transpose());
 
     if let Some(mask) = attention_mask {
-        let neg_inf = Tensor::zeros_like(&scores).add_scalar(f32::NEG_INFINITY);
+        let neg_inf = Tensor::zeros_like(&scores).add_scalar(-1e9);
         scores = scores.mask_where(mask.bool_not(), neg_inf);
     }
 
+    // let initial_dtype = scores.dtype();
+    // Upcast softmax
+    // let scores = scores.cast(FloatDType::F32);
     let weights = softmax(scores, 3); // (B, H, S, S)
+    // let weights = weights.cast(initial_dtype);
+
     // (B, H, S, S) @ (B, H, S, D) => (B, H, S, D)
-    let context = weights.matmul(value);
+    let context = weights.matmul(value).cast(initial_dtype);
     context.swap_dims(1, 2) //(B, S, H, D)
 }
 
@@ -653,11 +674,7 @@ impl QwenImageTransformerBlock {
             target_token_mask,
         );
 
-        let mut hidden_states =
-            hidden_states + img_gate2.tanh() * self.img_mlp.forward(img_modulated2);
-        if hidden_states.dtype() == DType::F16 {
-            hidden_states = hidden_states.clamp(-65504, 65504);
-        }
+        let hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp.forward(img_modulated2);
         hidden_states
     }
 }

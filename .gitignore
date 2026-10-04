@@ -2,5 +2,7 @@
 /reference
 /vae
 /out
+/weights
 prompt_embeds.bin
 latents_out.bin
+latents_out*

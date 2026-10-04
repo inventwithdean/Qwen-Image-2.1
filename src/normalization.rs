@@ -2,7 +2,7 @@ use burn::{
     Tensor,
     config::Config,
     module::{Module, Param},
-    tensor::Device,
+    tensor::{Device, FloatDType},
 };
 
 // elementwise_affine = true
@@ -17,11 +17,18 @@ pub struct RMSNorm {
 impl RMSNorm {
     pub fn forward(&self, hidden_states: Tensor<4>) -> Tensor<4> {
         // hidden_states: (B, S, H, D)
+        let initial_dtype = hidden_states.dtype();
+        let hidden_states = hidden_states.cast(FloatDType::F32);
         let variance = hidden_states.clone().powf_scalar(2.0).mean_dim(3); // (B, S, H, 1)
         let normalized = hidden_states * (variance + self.eps).sqrt().recip(); // (B, S, H, D)
 
-        let weight = self.weight.val().unsqueeze_dims::<4>(&[0, 1, 2]); // (1, 1, 1, D)
-        normalized * weight
+        let weight = self
+            .weight
+            .val()
+            .cast(FloatDType::F32)
+            .unsqueeze_dims::<4>(&[0, 1, 2]); // (1, 1, 1, D)
+        let out = normalized * weight;
+        out.cast(initial_dtype)
     }
 }
 
