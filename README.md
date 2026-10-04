@@ -28,7 +28,7 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 | 1024 x 1024 | 1 | 187 sec  | ~5.2 GB
 | 512 x 512 | 4 | 176 sec | ~6.2 GB
 
-#### Tested on an RTX 4060Ti 8GB.
+#### Tested on an RTX 4060Ti 8GB w/ 25 steps.
 
 ## Components
 - DiT (Completed)
