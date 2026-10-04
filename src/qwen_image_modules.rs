@@ -6,6 +6,8 @@ use burn::{
     tensor::{
         Bool, Device, FloatDType, Int,
         activation::{gelu_approximate, silu, softmax},
+        module::attention,
+        ops::AttentionModuleOptions,
         s,
     },
 };
@@ -433,7 +435,7 @@ struct QwenImageAttention {
     norm_k: RMSNorm,
 }
 
-fn attention(
+fn qwen_attention(
     query: Tensor<4>,
     key: Tensor<4>,
     value: Tensor<4>,
@@ -444,10 +446,16 @@ fn attention(
     let key = key.swap_dims(1, 2); // (B, H, S, D)
     let value = value.swap_dims(1, 2); // (B, H, S, D)
 
-    let initial_dtype = query.dtype();
-    let query = query.cast(FloatDType::F32);
-    let key = key.cast(FloatDType::F32);
-    let value = value.cast(FloatDType::F32);
+    // Flash Attention
+    let out = attention(
+        query,
+        key,
+        value,
+        attention_mask.map(|m| m.bool_not()), // true = masked out
+        None,
+        AttentionModuleOptions::default(),
+    ); // (B, H, S, D)
+    return out.swap_dims(1, 2); // (B, S, H, D)
 
     let head_dim = query.dims()[3] as f64;
     let scale = 1.0 / head_dim.sqrt();
@@ -461,14 +469,14 @@ fn attention(
         scores = scores.mask_where(mask.bool_not(), neg_inf);
     }
 
-    // let initial_dtype = scores.dtype();
     // Upcast softmax
-    // let scores = scores.cast(FloatDType::F32);
+    let initial_dtype = scores.dtype();
+    let scores = scores.cast(FloatDType::F32);
     let weights = softmax(scores, 3); // (B, H, S, S)
-    // let weights = weights.cast(initial_dtype);
+    let weights = weights.cast(initial_dtype);
 
     // (B, H, S, S) @ (B, H, S, D) => (B, H, S, D)
-    let context = weights.matmul(value).cast(initial_dtype);
+    let context = weights.matmul(value); //.cast(initial_dtype);
     context.swap_dims(1, 2) //(B, S, H, D)
 }
 
@@ -547,7 +555,7 @@ impl QwenImageAttention {
                     }
                 }
 
-                outputs.push(attention(
+                outputs.push(qwen_attention(
                     query.clone().slice(s![.., start..end, .., ..]),
                     key.clone().slice(s![.., 0..end, .., ..]),
                     value.clone().slice(s![.., 0..end, .., ..]),
@@ -556,7 +564,7 @@ impl QwenImageAttention {
             }
             // (B, 1, 1, S)
             let trailing_mask = key_valid.map(|kv| kv.unsqueeze_dims::<4>(&[1, 2]));
-            outputs.push(attention(
+            outputs.push(qwen_attention(
                 query.slice(s![.., prefix_len.., .., ..]),
                 key,
                 value,
@@ -566,7 +574,7 @@ impl QwenImageAttention {
             let prefill_hidden_states = Tensor::cat(outputs, 1);
             prefill_hidden_states.slice(s![.., 0..seq_len_q, .., ..]) // (B, S, 32, 128)
         } else {
-            let decode_hidden_states = attention(query, key, value, attention_mask);
+            let decode_hidden_states = qwen_attention(query, key, value, attention_mask);
             decode_hidden_states.slice(s![.., 0..seq_len_q, .., ..])
         };
 
