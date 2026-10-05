@@ -9,7 +9,9 @@ use burn::{
 };
 use burn_store::{BurnpackStore, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 use qwen_image::{
-    qwen_image::{QwenImageBlockStreamer, QwenImageTransformerModelConfig},
+    qwen_image::{
+        QwenImageBlockStreamer, QwenImageTransformerModel, QwenImageTransformerModelConfig,
+    },
     qwen_image_modules::{KvCacheMode, QwenImageKVCache, QwenImageTransformerBlockConfig},
 };
 
@@ -63,9 +65,33 @@ fn main() {
 
     let mut streamer = QwenImageBlockStreamer::new(src, &config, &device);
 
-    let prompt_floats: Vec<f32> = read_f32("prompt_embeds.bin");
+    let file_name = format!("prompt_embeds.bin");
+    let latents = generate_image(&model, &mut streamer, &device, &file_name);
+    let final_data = latents
+        .cast(FloatDType::F32)
+        .into_data()
+        .try_into_vec::<f32>()
+        .unwrap();
+
+    let out_bytes: Vec<u8> = final_data
+        .into_iter()
+        .flat_map(|f| f.to_ne_bytes())
+        .collect();
+    std::fs::write(format!("latents_out.bin"), out_bytes)
+        .expect("Failed to save latents_out.bin!");
+    println!("Saved latents_out.bin!");
+}
+
+/// Returns latent vectors.
+fn generate_image(
+    model: &QwenImageTransformerModel,
+    streamer: &mut QwenImageBlockStreamer,
+    device: &Device,
+    file_name: &str,
+) -> Tensor<3> {
+    let prompt_floats: Vec<f32> = read_f32(file_name);
     let t_text = prompt_floats.len() / 4096;
-    
+
     // Generation Config
     let (h, w) = (48_usize, 48_usize);
     let batch_size = 1;
@@ -74,19 +100,19 @@ fn main() {
     let slots = target_tokens / 4;
     let img_shapes = vec![(1, h, w)];
     let encoder_hidden_states =
-        Tensor::<1>::from_floats(prompt_floats.as_slice(), &device).reshape([1, t_text, 4096]);
+        Tensor::<1>::from_floats(prompt_floats.as_slice(), device).reshape([1, t_text, 4096]);
 
     let encoder_hidden_states = encoder_hidden_states.repeat_dim(0, batch_size);
 
     let mut latents = Tensor::<3>::random(
         [batch_size, target_tokens, 64],
         Distribution::Normal(0.0, 1.0),
-        &device,
+        device,
     )
     .cast(FloatDType::F32);
 
     let mask_ints: Vec<i64> = (0..t_text + slots).map(|i| (i >= t_text) as i64).collect();
-    let img_mask = Tensor::<1, Int>::from_ints(mask_ints.as_slice(), &device)
+    let img_mask = Tensor::<1, Int>::from_ints(mask_ints.as_slice(), device)
         .reshape([1, t_text + slots])
         .bool();
     let img_mask = img_mask.repeat_dim(0, batch_size);
@@ -94,7 +120,7 @@ fn main() {
     let steps = 25;
     let sigmas: Vec<f32> = schedule(steps, target_tokens);
 
-    let mut kv_cache = QwenImageKVCache::new(streamer.num_layers, batch_size, &device);
+    let mut kv_cache = QwenImageKVCache::new(streamer.num_layers, batch_size, device);
 
     let total = Instant::now();
     for step in 0..steps {
@@ -105,10 +131,10 @@ fn main() {
         } else {
             KvCacheMode::CACHED
         };
-        let timestep = Tensor::<1>::from_floats([sigmas[step]], &device);
+        let timestep = Tensor::<1>::from_floats([sigmas[step]], device);
 
         let out = model.forward(
-            &mut streamer,
+            streamer,
             latents.clone().cast(FloatDType::BF16),
             encoder_hidden_states.clone(),
             timestep,
@@ -127,34 +153,21 @@ fn main() {
         // Euler step
         latents = latents + pred * (sigmas[step + 1] - sigmas[step]);
 
-        let _ = latents.clone().sum_dim(0).sum_dim(1).sum_dim(2).into_data();
-        let sample = latents
-            .clone()
-            .slice(s![0..1, 0..1, 0..5])
-            .cast(FloatDType::F32)
-            .into_data()
-            .try_into_vec::<f32>()
-            .unwrap();
-        println!("Step {:>2} sample: {:?}", step, sample);
+        // let _ = latents.clone().sum_dim(0).sum_dim(1).sum_dim(2).into_data();
+        // let sample = latents
+        //     .clone()
+        //     .slice(s![0..1, 0..1, 0..5])
+        //     .cast(FloatDType::F32)
+        //     .into_data()
+        //     .try_into_vec::<f32>()
+        //     .unwrap();
+        // println!("Step {:>2} sample: {:?}", step, sample);
 
         let step_time = t.elapsed();
         println!("step {step:>2}: {step_time:.2?}",);
     }
     println!("{steps} steps: {:.2?}", total.elapsed());
-
-    let final_data = latents
-        .cast(FloatDType::F32)
-        .into_data()
-        .try_into_vec::<f32>()
-        .unwrap();
-
-    let out_bytes: Vec<u8> = final_data
-        .into_iter()
-        .flat_map(|f| f.to_ne_bytes())
-        .collect();
-
-    std::fs::write("latents_out.bin", out_bytes).expect("Failed to save latents_out.bin");
-    println!("Saved latents_out.bin.");
+    latents
 }
 
 fn _convert_to_bpk() {

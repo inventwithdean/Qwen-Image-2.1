@@ -1,17 +1,17 @@
 
 # Qwen Image 2.1
 
-This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) which currently sits at Rank 1 of [Text-to-Image Arena](https://arena.ai/leaderboard/text-to-image?license=open-source) in Open Source category as of 04/10/26.
+This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) using the Burn framework. The model currently sits at Rank 1 of [Text-to-Image Arena](https://arena.ai/leaderboard/text-to-image?license=open-source) in Open Source category as of October, 2026.
 
-#### Sample Generation: 
+#### Sample Generations: 
 
-![A sample image generated](./generations/main.png)
+![A sample image generated](./generations/image_1.png)
 
 <table>
   <tr>
-    <td><img src="./generations/sample_04.png" alt="Sample generation 1" width="100%"></td>
-    <td><img src="./generations/sample_05.png" alt="Sample generation 2" width="100%"></td>
-    <td><img src="./generations/sample_03.png" alt="Sample generation 3" width="100%"></td>
+    <td><img src="./generations/image_2.png" alt="Sample generation 3" width="100%"></td>
+    <td><img src="./generations/image_3.png" alt="Sample generation 2" width="100%"></td>
+    <td><img src="./generations/image_4.png" alt="Sample generation 1" width="100%"></td>
   </tr>
 </table>
 
@@ -37,10 +37,6 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 
 ## Flash Attention
 Flash attention doesn't require materializing full N x N matrix hence saving us a lot of VRAM.
-
-#### 1024x1024 Image generated utilizing only ~5.2GB peak VRAM.
-![A sample 1024x1024 image generated](./generations/sample_06.png)
-
 
 ## License
 
