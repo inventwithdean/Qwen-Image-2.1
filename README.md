@@ -16,8 +16,9 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 </table>
 
 ## Features
-- Full BF16 weights for high fidelity generation
-- RAM Layer Streaming for Low VRAM usage
+- Runs on any GPU (wgpu backend).
+- int8 block quantized transformer Blocks.
+- RAM Layer Streaming for Low VRAM usage.
 
 ## Speed Test
 
@@ -28,7 +29,7 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 | 1024 x 1024 | 1 | 187 sec  | ~5.2 GB
 | 512 x 512 | 4 | 176 sec | ~6.2 GB
 
-#### Tested on an RTX 4060Ti 8GB w/ 25 steps.
+#### Tested on cuda backend (BF16) on an RTX 4060Ti 8GB w/ 25 steps.
 
 ## Components
 - DiT (Completed)
@@ -36,7 +37,7 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 - Text Encoder (TODO)
 
 ## Flash Attention
-Flash attention doesn't require materializing full N x N matrix hence saving us a lot of VRAM.
+Flash attention doesn't require materializing full N x N matrix hence saving us a lot of VRAM. Available only on supported backends.
 
 ## License
 

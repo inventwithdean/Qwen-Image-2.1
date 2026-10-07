@@ -2,12 +2,18 @@ use std::{path::Path, time::Instant};
 
 use burn::{
     Tensor,
-    backend::CudaDevice,
-    module::Module,
+    module::{Module, Quantizer},
     store::ModuleRecord,
-    tensor::{Device, Distribution, FloatDType, Int, IntDType, s},
+    tensor::{
+        Device, Distribution, FloatDType, Int,
+        quantization::{Calibration, QuantScheme, ScaleDtype},
+        s,
+    },
 };
-use burn_store::{BurnpackStore, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+use burn_store::{
+    BurnpackStore, FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter,
+    SafetensorsStore,
+};
 use qwen_image::{
     qwen_image::{
         QwenImageBlockStreamer, QwenImageTransformerModel, QwenImageTransformerModelConfig,
@@ -48,13 +54,10 @@ fn schedule(steps: usize, seq_len: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let mut device: Device = CudaDevice::default().into();
-    match device.supports_dtype(FloatDType::BF16) {
-        true => println!("Supports BF16"),
-        false => println!("Doesn't support BF16"),
-    }
+    let device: Device = Device::wgpu(Default::default());
 
-    device.configure((FloatDType::BF16, IntDType::I32)).unwrap();
+    // Convert BF16 weights to int8 .bpk files
+    // _convert_to_bpk(&device);
     let config = QwenImageTransformerModelConfig::new([16, 56, 56]);
 
     let src = "./out";
@@ -77,8 +80,7 @@ fn main() {
         .into_iter()
         .flat_map(|f| f.to_ne_bytes())
         .collect();
-    std::fs::write(format!("latents_out.bin"), out_bytes)
-        .expect("Failed to save latents_out.bin!");
+    std::fs::write(format!("latents_out.bin"), out_bytes).expect("Failed to save latents_out.bin!");
     println!("Saved latents_out.bin!");
 }
 
@@ -135,7 +137,7 @@ fn generate_image(
 
         let out = model.forward(
             streamer,
-            latents.clone().cast(FloatDType::BF16),
+            latents.clone(), //.cast(FloatDType::BF16),
             encoder_hidden_states.clone(),
             timestep,
             img_shapes.clone(),
@@ -153,15 +155,15 @@ fn generate_image(
         // Euler step
         latents = latents + pred * (sigmas[step + 1] - sigmas[step]);
 
-        // let _ = latents.clone().sum_dim(0).sum_dim(1).sum_dim(2).into_data();
-        // let sample = latents
-        //     .clone()
-        //     .slice(s![0..1, 0..1, 0..5])
-        //     .cast(FloatDType::F32)
-        //     .into_data()
-        //     .try_into_vec::<f32>()
-        //     .unwrap();
-        // println!("Step {:>2} sample: {:?}", step, sample);
+        let _ = latents.clone().sum_dim(0).sum_dim(1).sum_dim(2).into_data();
+        let sample = latents
+            .clone()
+            .slice(s![0..1, 0..1, 0..5])
+            .cast(FloatDType::F32)
+            .into_data()
+            .try_into_vec::<f32>()
+            .unwrap();
+        println!("Step {:>2} sample: {:?}", step, sample);
 
         let step_time = t.elapsed();
         println!("step {step:>2}: {step_time:.2?}",);
@@ -170,9 +172,8 @@ fn generate_image(
     latents
 }
 
-fn _convert_to_bpk() {
-    let device: Device = CudaDevice::default().into();
-
+/// Converts BF16 safetensors to burn .mpk files with transformer blocks quantized to int8
+fn _convert_to_bpk(device: &Device) {
     const SHARDS: [&str; 2] = [
         "diffusion_pytorch_model-00001-of-00002.safetensors",
         "diffusion_pytorch_model-00002-of-00002.safetensors",
@@ -183,16 +184,23 @@ fn _convert_to_bpk() {
     let out = Path::new("out");
     std::fs::create_dir_all(out).unwrap();
 
+    let from_adapter = PyTorchToBurnAdapter.chain(FloatCastAdapter::to(FloatDType::F32.into()));
+
     let mut shell = QwenImageTransformerModelConfig::new([16, 56, 56])
         .with_num_layers(0)
         .init(&device);
 
     for shard in SHARDS {
         let mut store = SafetensorsStore::from_file(Path::new(src).join(shard))
-            .with_from_adapter(PyTorchToBurnAdapter)
+            .with_from_adapter(from_adapter.clone())
             .allow_partial(true);
         shell.load_from(&mut store).unwrap();
     }
+
+    // The shell isn't being quantized and is stored in F32.
+    // let quant_scheme = QuantScheme::default().with_value(QuantValue::Q4F);
+    // let mut quantizer = Quantizer::new(Calibration::MinMax, quant_scheme);
+    // shell = shell.quantize_weights(&mut quantizer);
 
     let mut out_store = BurnpackStore::from_file(out.join("shell.bpk"));
     shell.save_into(&mut out_store).unwrap();
@@ -201,15 +209,21 @@ fn _convert_to_bpk() {
     let inner_dim = 32 * 128;
     let block_config = QwenImageTransformerBlockConfig::new(inner_dim, 32, 128, 3, 1e-6);
 
+    let quant_scheme = QuantScheme::default().per_block([64], ScaleDtype::F32);
+    let mut quantizer = Quantizer::new(Calibration::MinMax, quant_scheme);
+
     for i in 0..NUM_LAYERS {
         let mut block = block_config.init(&device);
         for shard in SHARDS {
             let mut store = SafetensorsStore::from_file(Path::new(src).join(shard))
-                .with_from_adapter(PyTorchToBurnAdapter)
+                .with_from_adapter(from_adapter.clone())
                 .with_key_remapping(&format!(r"^transformer_blocks\.{i}\."), "")
                 .allow_partial(true);
             block.load_from(&mut store).unwrap();
         }
+
+        let block = block.quantize_weights(&mut quantizer);
+
         let mut out_store = BurnpackStore::from_file(out.join(format!("block_{i}.bpk")));
         block.save_into(&mut out_store).unwrap();
         println!("saved out/block_{i}.bpk");

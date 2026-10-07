@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.22", features = ["std", "cuda", "fusion"], default-features = false }
+burn = { version = "0.22", features = ["std", "wgpu", "fusion"], default-features = false }
 burn-store = "0.22"
 safetensors = "0.8.0"
 serde = "1.0.229"

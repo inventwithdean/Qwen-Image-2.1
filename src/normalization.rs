@@ -21,11 +21,10 @@ impl RMSNorm {
         let hidden_states = hidden_states.cast(FloatDType::F32);
         let variance = hidden_states.clone().powf_scalar(2.0).mean_dim(3); // (B, S, H, 1)
         let normalized = hidden_states * (variance + self.eps).sqrt().recip(); // (B, S, H, D)
-
         let weight = self
             .weight
             .val()
-            .cast(FloatDType::F32)
+            // .cast(FloatDType::F32) // CAST it to F32 when running in BF16 mode
             .unsqueeze_dims::<4>(&[0, 1, 2]); // (1, 1, 1, D)
         let out = normalized * weight;
         out.cast(initial_dtype)

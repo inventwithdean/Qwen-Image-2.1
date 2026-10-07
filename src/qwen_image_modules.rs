@@ -171,7 +171,7 @@ impl QwenImageZeroCenterRMSNorm {
         let weight = self
             .weight
             .val()
-            .cast(FloatDType::F32)
+            // .cast(FloatDType::F32) // Cast to F32 when using BF16
             .unsqueeze_dim::<2>(0)
             .unsqueeze_dim::<3>(0)
             + 1.0; // (1, dim)
