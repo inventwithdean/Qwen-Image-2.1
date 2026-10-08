@@ -507,3 +507,68 @@ impl QwenImageMidBlockConfig {
         }
     }
 }
+
+#[derive(Module, Debug)]
+pub struct QwenImageResidualDownBlock {
+    avg_shortcut: QwenImageAvgDown3D,
+    resnets: Vec<QwenImageResidualBlock>,
+    downsampler: Option<QwenImageResample>,
+}
+
+impl QwenImageResidualDownBlock {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
+        let x_copy = x.clone();
+        let mut x = x;
+        for resnet in &self.resnets {
+            x = resnet.forward(x);
+        }
+        if let Some(downsampler) = &self.downsampler {
+            x = downsampler.forward(x);
+        }
+
+        x + self.avg_shortcut.forward(x_copy)
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct QwenImageResidualDownBlockConfig {
+    in_dim: usize,
+    out_dim: usize,
+    num_res_blocks: usize,
+    #[config(default = false)]
+    temporal_downsample: bool,
+    #[config(default = false)]
+    down_flag: bool,
+}
+
+impl QwenImageResidualDownBlockConfig {
+    pub fn init(&self, device: &Device) -> QwenImageResidualDownBlock {
+        let factor_t = if self.temporal_downsample { 2 } else { 1 };
+        let factor_s = if self.down_flag { 2 } else { 1 };
+        let mut resnets = vec![];
+        let mut in_dim = self.in_dim;
+        for _ in 0..self.num_res_blocks {
+            resnets.push(QwenImageResidualBlockConfig::new(in_dim, self.out_dim).init(device));
+            in_dim = self.out_dim;
+        }
+        let downsampler = match self.down_flag {
+            true => {
+                let mode = if self.temporal_downsample {
+                    ResampleMode::Downsample3D
+                } else {
+                    ResampleMode::Downsample2D
+                };
+                Some(QwenImageResampleConfig::new(self.out_dim, mode).init(device))
+            }
+            false => None,
+        };
+
+        QwenImageResidualDownBlock {
+            avg_shortcut: QwenImageAvgDown3DConfig::new(self.in_dim, self.out_dim, factor_t)
+                .with_factor_s(factor_s)
+                .init(),
+            resnets,
+            downsampler,
+        }
+    }
+}
