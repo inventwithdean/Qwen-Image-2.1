@@ -8,8 +8,9 @@ use burn::{
     },
     tensor::{
         Device,
-        module::interpolate,
-        ops::{InterpolateMode, InterpolateOptions, PadMode},
+        activation::silu,
+        module::{attention, interpolate},
+        ops::{AttentionModuleOptions, InterpolateMode, InterpolateOptions, PadMode},
         s,
     },
 };
@@ -352,5 +353,115 @@ impl QwenImageResampleConfig {
             ),
         };
         QwenImageResample { resample }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct QwenImageResidualBlock {
+    norm1: QwenImageRMSNorm,
+    conv1: QwenImageCausalConv3D,
+    norm2: QwenImageRMSNorm,
+    conv2: QwenImageCausalConv3D,
+    conv_shortcut: Option<QwenImageCausalConv3D>,
+}
+
+impl QwenImageResidualBlock {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
+        // x: (B, C, T, H, W)
+        let h = match &self.conv_shortcut {
+            Some(shortcut) => shortcut.forward(x.clone()),
+            None => x.clone(),
+        };
+
+        let x = self.norm1.forward(x);
+        let x = silu(x);
+        let x = self.conv1.forward(x);
+
+        let x = self.norm2.forward(x);
+        let x = silu(x);
+        let x = self.conv2.forward(x);
+        x + h
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct QwenImageResidualBlockConfig {
+    in_dim: usize,
+    out_dim: usize,
+}
+
+impl QwenImageResidualBlockConfig {
+    pub fn init(&self, device: &Device) -> QwenImageResidualBlock {
+        let conv_shortcut = if self.in_dim != self.out_dim {
+            Some(QwenImageCausalConv3DConfig::new(self.in_dim, self.out_dim, [1, 1]).init(device))
+        } else {
+            None
+        };
+        QwenImageResidualBlock {
+            norm1: QwenImageRMSNormConfig::new(self.in_dim).init(device),
+            conv1: QwenImageCausalConv3DConfig::new(self.in_dim, self.out_dim, [3, 3])
+                .with_padding([1, 1])
+                .init(device),
+            norm2: QwenImageRMSNormConfig::new(self.out_dim).init(device),
+            conv2: QwenImageCausalConv3DConfig::new(self.out_dim, self.out_dim, [3, 3])
+                .with_padding([1, 1])
+                .init(device),
+            conv_shortcut,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct QwenImageAttentionBlock {
+    norm: QwenImageRMSNorm,
+    to_qkv: Conv2d,
+    proj: Conv2d,
+}
+
+impl QwenImageAttentionBlock {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
+        // x: (B, C, T, H, W)
+        let identity = x.clone();
+        let [b, c, t, h, w] = x.dims();
+
+        let x = x.permute([0, 2, 1, 3, 4]); // (B, T, C, H, W)
+        let x = x.reshape([b * t, c, h, w]); // (B * T, C, H, W)
+        let x = self.norm.forward(x);
+
+        let qkv = self.to_qkv.forward(x); // (B * T, C, H, W)
+        let qkv = qkv.reshape([b * t, 1, c * 3, h * w]);
+        let qkv = qkv.permute([0, 1, 3, 2]); // (B * T, 1, H * W, C * 3)
+        let qkv_chunks = qkv.chunk(3, 3);
+        let (q, k, v) = (
+            qkv_chunks[0].clone(),
+            qkv_chunks[1].clone(),
+            qkv_chunks[2].clone(),
+        );
+        // Each of q, k and v is now (B * T, 1, H * W, C)
+        // expects (batch_size, num_heads, seq_len, head_dim)
+        let x = attention(q, k, v, None, None, AttentionModuleOptions::default());
+        let x = x.squeeze_dim::<3>(1); // (B * T, H * W, C)
+        let x = x.permute([0, 2, 1]); // (B * T, C, H * W)
+        let x = x.reshape([b * t, c, h, w]); // (B * T, C, H, W)
+
+        let x = self.proj.forward(x);
+        let x = x.reshape([b, t, c, h, w]);
+        let x = x.permute([0, 2, 1, 3, 4]); // (B, C, T, H, W)
+        x + identity
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct QwenImageAttentionBlockConfig {
+    dim: usize,
+}
+
+impl QwenImageAttentionBlockConfig {
+    pub fn init(&self, device: &Device) -> QwenImageAttentionBlock {
+        QwenImageAttentionBlock {
+            norm: QwenImageRMSNormConfig::new(self.dim).init(device),
+            to_qkv: Conv2dConfig::new([self.dim, self.dim * 3], [1, 1]).init(device),
+            proj: Conv2dConfig::new([self.dim, self.dim], [1, 1]).init(device),
+        }
     }
 }
