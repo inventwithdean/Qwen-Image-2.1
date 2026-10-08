@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Module, Debug)]
 pub struct QwenImageAvgDown3D {
-    in_channels: usize,
     out_channels: usize,
     factor_t: usize,
     factor_s: usize,
@@ -85,7 +84,6 @@ impl QwenImageAvgDown3DConfig {
 
         let group_size = self.in_channels * factor / self.out_channels;
         QwenImageAvgDown3D {
-            in_channels: self.in_channels,
             out_channels: self.out_channels,
             factor_t: self.factor_t,
             factor_s: self.factor_s,
@@ -97,11 +95,9 @@ impl QwenImageAvgDown3DConfig {
 
 #[derive(Module, Debug)]
 pub struct QwenImageDupUp3D {
-    in_channels: usize,
     out_channels: usize,
     factor_t: usize,
     factor_s: usize,
-    factor: usize,
     repeats: usize,
 }
 
@@ -150,11 +146,9 @@ impl QwenImageDupUp3DConfig {
         assert!(self.out_channels * factor % self.in_channels == 0);
         let repeats = self.out_channels * factor / self.in_channels;
         QwenImageDupUp3D {
-            in_channels: self.in_channels,
             out_channels: self.out_channels,
             factor_t: self.factor_t,
             factor_s: self.factor_s,
-            factor,
             repeats,
         }
     }
