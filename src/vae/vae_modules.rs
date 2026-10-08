@@ -465,3 +465,45 @@ impl QwenImageAttentionBlockConfig {
         }
     }
 }
+
+#[derive(Module, Debug)]
+pub struct QwenImageMidBlock {
+    resnets: Vec<QwenImageResidualBlock>,
+    attentions: Vec<QwenImageAttentionBlock>,
+}
+
+impl QwenImageMidBlock {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
+        // x: (B, C, T, H, W)
+        let mut x = self.resnets[0].forward(x);
+
+        for (attn, resnet) in self.attentions.iter().zip(self.resnets.iter().skip(1)) {
+            x = attn.forward(x);
+            x = resnet.forward(x);
+        }
+
+        x
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct QwenImageMidBlockConfig {
+    dim: usize,
+    #[config(default = 1)]
+    num_layers: usize,
+}
+
+impl QwenImageMidBlockConfig {
+    pub fn init(&self, device: &Device) -> QwenImageMidBlock {
+        let mut resnets = vec![QwenImageResidualBlockConfig::new(self.dim, self.dim).init(device)];
+        let mut attentions = vec![];
+        for _ in 0..self.num_layers {
+            attentions.push(QwenImageAttentionBlockConfig::new(self.dim).init(device));
+            resnets.push(QwenImageResidualBlockConfig::new(self.dim, self.dim).init(device));
+        }
+        QwenImageMidBlock {
+            resnets,
+            attentions,
+        }
+    }
+}
