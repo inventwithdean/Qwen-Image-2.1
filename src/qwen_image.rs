@@ -6,7 +6,7 @@ use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
     store::ModuleRecord,
-    tensor::{Bool, Device, IndexingUpdateOp, Int, activation::silu, s},
+    tensor::{Bool, Bytes, Device, IndexingUpdateOp, Int, activation::silu, s},
 };
 
 use crate::qwen_image_modules::{
@@ -16,6 +16,141 @@ use crate::qwen_image_modules::{
     QwenImageTimestepProjEmbeddingsConfig, QwenImageTransformerBlock,
     QwenImageTransformerBlockConfig, qwenimage_prefix_segments,
 };
+
+use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+
+/// Anything that can hand the model one transformer block at a time.
+pub trait BlockProvider {
+    fn num_layers(&self) -> usize;
+    fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock;
+}
+
+impl BlockProvider for QwenImageBlockStreamer {
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+    fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
+        QwenImageBlockStreamer::get(self, layer) // inherent method
+    }
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// FileSystemSyncAccessHandle (OPFS, dedicated workers only)
+    pub type SyncHandle;
+
+    #[wasm_bindgen(method, js_name = getSize)]
+    fn get_size(this: &SyncHandle) -> f64;
+
+    // JS writes straight into wasm memory through a view over `buf`.
+    #[wasm_bindgen(method, js_name = read)]
+    fn read_at(this: &SyncHandle, buf: &mut [u8], opts: &JsValue) -> f64;
+
+    #[wasm_bindgen(method, js_name = close)]
+    fn close(this: &SyncHandle);
+}
+
+fn read_opts(at: usize) -> JsValue {
+    let o = js_sys::Object::new();
+    js_sys::Reflect::set(&o, &"at".into(), &JsValue::from_f64(at as f64)).unwrap();
+    o.into()
+}
+
+pub struct QwenImageBlockStreamerWeb {
+    pub num_layers: usize,
+    handles: Vec<SyncHandle>, // one OPFS file per block, index == layer
+    active_block: Option<QwenImageTransformerBlock>, // the single reusable GPU block
+}
+
+impl QwenImageBlockStreamerWeb {
+    pub fn new_empty(config: &QwenImageTransformerModelConfig, device: &Device) -> Self {
+        let inner_dim = config.num_attention_heads * config.attention_head_dim;
+        let block_config = QwenImageTransformerBlockConfig::new(
+            inner_dim,
+            config.num_attention_heads,
+            config.attention_head_dim,
+            config.mlp_ratio,
+            config.eps,
+        );
+
+        Self {
+            num_layers: config.num_layers,
+            handles: Vec::with_capacity(config.num_layers),
+            active_block: Some(block_config.init(device)),
+        }
+    }
+
+    /// Register the OPFS file for the next layer (must be called in layer order).
+    pub fn add_handle(&mut self, handle: SyncHandle) -> Result<usize, String> {
+        if self.handles.len() >= self.num_layers {
+            return Err(format!("already have {} handles", self.num_layers));
+        }
+        self.handles.push(handle);
+        Ok(self.handles.len() - 1)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.handles.len() == self.num_layers
+    }
+
+    pub fn block_size(&self, layer: usize) -> usize {
+        self.handles[layer].get_size() as usize
+    }
+
+    /// Synchronously read one block file from disk into wasm memory.
+    fn read_record(&self, layer: usize) -> ModuleRecord {
+        let h = &self.handles[layer];
+        let size = h.get_size() as usize;
+        let mut buf = vec![0u8; size];
+
+        let mut off = 0;
+        while off < size {
+            let n = h.read_at(&mut buf[off..], &read_opts(off)) as usize;
+            assert!(
+                n > 0,
+                "OPFS read returned 0 bytes (block {layer}, offset {off}/{size})"
+            );
+            off += n;
+        }
+
+        ModuleRecord::from_bytes(Bytes::from_bytes_vec(buf))
+            .unwrap_or_else(|e| panic!("block {layer}: bad record: {e:?}"))
+    }
+
+    pub fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
+        assert!(
+            self.is_ready(),
+            "only {}/{} block handles registered",
+            self.handles.len(),
+            self.num_layers
+        );
+
+        // disk -> wasm (one block, freed when load_record consumes it) -> GPU
+        let record = self.read_record(layer);
+
+        let block = self
+            .active_block
+            .take()
+            .expect("Active block not initialized");
+        self.active_block = Some(block.load_record(record));
+        self.active_block.as_ref().unwrap()
+    }
+
+    pub fn close_all(&mut self) {
+        for h in self.handles.drain(..) {
+            h.close();
+        }
+    }
+}
+
+impl BlockProvider for QwenImageBlockStreamerWeb {
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+    fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
+        QwenImageBlockStreamerWeb::get(self, layer)
+    }
+}
 
 pub struct QwenImageBlockStreamer {
     pub num_layers: usize,
@@ -114,15 +249,10 @@ pub struct QwenImageTransformerModel {
 
 impl QwenImageTransformerModel {
     pub fn build_token_metadata(
-        image_pad_mask: Tensor<1, Bool>,
+        image_pad_mask_vec: &[bool],
         img_shapes: Vec<(usize, usize, usize)>,
         device: &Device,
-    ) -> (Tensor<1, Int>, Tensor<1, Bool>) {
-        let image_pad_mask_vec = image_pad_mask
-            .into_data()
-            .iter::<bool>()
-            .collect::<Vec<bool>>();
-
+    ) -> (Vec<i64>, Tensor<1, Bool>, Vec<bool>) {
         let mut image_ids_vec = vec![-1_i64; image_pad_mask_vec.len()];
         let mut target_token_mask_vec = vec![false; image_pad_mask_vec.len()];
 
@@ -146,8 +276,6 @@ impl QwenImageTransformerModel {
             }
         }
 
-        let image_ids = Tensor::<1, Int>::from_ints(image_ids_vec.as_slice(), device);
-
         let target_token_mask_int: Vec<i64> = target_token_mask_vec
             .iter()
             .map(|&b| if b { 1 } else { 0 })
@@ -155,17 +283,17 @@ impl QwenImageTransformerModel {
         let target_token_mask =
             Tensor::<1, Int>::from_ints(target_token_mask_int.as_slice(), device).bool();
 
-        (image_ids, target_token_mask)
+        (image_ids_vec, target_token_mask, target_token_mask_vec)
     }
 
     pub fn forward(
         &self,
-        streamer: &mut QwenImageBlockStreamer,
+        streamer: &mut impl BlockProvider,
         hidden_states: Tensor<3>,
         encoder_hidden_states: Tensor<3>,
         timestep: Tensor<1>,
         img_shapes: Vec<(usize, usize, usize)>,
-        img_mask: Tensor<2, Bool>,
+        img_mask: &[bool],
         encoder_hidden_states_mask: Option<Tensor<2, Bool>>,
         mut kv_cache: Option<&mut QwenImageKVCache>,
         kv_cache_mode: Option<KvCacheMode>,
@@ -177,12 +305,7 @@ impl QwenImageTransformerModel {
 
         let encoder_hidden_states = self.txt_in.forward(encoder_hidden_states);
 
-        let img_mask_bool = img_mask
-            .clone()
-            .slice(s![0..1, ..])
-            .into_data()
-            .iter::<bool>()
-            .collect::<Vec<bool>>();
+        let img_mask_bool: &[bool] = img_mask;
 
         let mut image_pad_mask_vec = Vec::new();
         let mut repeat_indices = Vec::new();
@@ -267,17 +390,12 @@ impl QwenImageTransformerModel {
             IndexingUpdateOp::Assign,
         );
 
-        let image_pad_mask_int: Vec<i64> = image_pad_mask_vec
-            .iter()
-            .map(|&b| if b { 1 } else { 0 })
-            .collect();
-        let image_pad_mask =
-            Tensor::<1, Int>::from_ints(image_pad_mask_int.as_slice(), device).bool();
+        let (image_ids, target_token_mask, target_token_mask_vec) =
+            Self::build_token_metadata(&image_pad_mask_vec, img_shapes.clone(), device);
 
-        let (image_ids, target_token_mask) =
-            Self::build_token_metadata(image_pad_mask.clone(), img_shapes.clone(), device);
-
-        let (cos, sin) = self.pos_embed.forward(img_shapes, image_pad_mask);
+        let (cos, sin) = self
+            .pos_embed
+            .forward(img_shapes, &image_pad_mask_vec, device);
         let mut rotary_emb = (cos, sin);
 
         let t_zero = Tensor::<1>::zeros([1], device);
@@ -285,12 +403,6 @@ impl QwenImageTransformerModel {
         let temb = self.time_text_embed.forward(timestep);
 
         let modulation = self.modulation.1.forward(silu(temb.clone()));
-
-        let target_token_mask_vec = target_token_mask
-            .clone()
-            .into_data()
-            .iter::<bool>()
-            .collect::<Vec<bool>>();
 
         let prefix_len = target_token_mask_vec.iter().filter(|&&b| !b).count();
         let mut modulation_mask = target_token_mask.clone();
@@ -316,10 +428,10 @@ impl QwenImageTransformerModel {
             attention_mask = block_key_valid.map(|jkv| jkv.unsqueeze_dims::<4>(&[1, 2]));
             block_key_valid = None;
         } else {
-            segments = Some(qwenimage_prefix_segments(image_ids, prefix_len));
+            segments = Some(qwenimage_prefix_segments(&image_ids, prefix_len));
         }
 
-        for i in 0..streamer.num_layers {
+        for i in 0..streamer.num_layers() {
             let layer_cache = kv_cache.as_deref_mut().map(|cache| cache.get_layer_mut(i));
 
             joint_hidden_states = streamer.get(i).forward(

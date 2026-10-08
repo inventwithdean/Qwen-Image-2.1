@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Qwen Image 2.1 WebGPU</title>
+    <style>body { font-family: sans-serif; padding: 20px; }</style>
+</head>
+<body>
+    <h2>Qwen Image 2.1 WebGPU Inference</h2>
+    <button id="start-btn">Start Generation</button>
+    <button id="save-btn" disabled>Download latents</button>
+    <pre id="logs" style="background:#eee; padding:10px; margin-top:20px; min-height: 50px;"></pre>
+
+    <script>
+        const btn = document.getElementById('start-btn');
+        const saveBtn = document.getElementById('save-btn');
+        const logs = document.getElementById('logs');
+        let lastLatents = null;
+
+        function log(msg) {
+            logs.textContent += msg + '\n';
+            console.log(msg);
+        }
+
+        // Raw float32, little-endian -> np.fromfile(path, dtype=np.float32)
+        function downloadLatents(latents, filename = 'latents_out.bin') {
+            const blob = new Blob([latents], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 10_000);
+        }
+
+        const worker = new Worker('worker.js', { type: 'module' });
+
+        worker.onmessage = (event) => {
+            const data = event.data;
+            if (data.type === 'DONE') {
+                lastLatents = new Float32Array(data.latents.buffer ?? data.latents);
+                log(`Inference complete! ${lastLatents.length} floats (${lastLatents.byteLength} bytes)`);
+                saveBtn.disabled = false;
+                btn.disabled = false;
+                downloadLatents(lastLatents);   // auto-save
+            } else if (data.type === 'ERROR') {
+                log("Error: " + data.message);
+                btn.disabled = false;
+            }
+        };
+
+        btn.addEventListener('click', () => {
+            btn.disabled = true;
+            saveBtn.disabled = true;
+            log("Sending start signal to worker...");
+            worker.postMessage({ type: 'START_INFERENCE' });
+        });
+
+        saveBtn.addEventListener('click', () => {
+            if (lastLatents) downloadLatents(lastLatents);
+        });
+    </script>
+</body>
+</html>

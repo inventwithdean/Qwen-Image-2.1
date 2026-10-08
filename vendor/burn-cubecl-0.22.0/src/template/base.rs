@@ -1,0 +1,118 @@
+use super::SourceTemplate;
+use crate::tensor::CubeTensor;
+use cubecl::{
+    CubeKernel, PrecompiledSource,
+    ir::{UIntKind, metadata::Info},
+    prelude::*,
+};
+
+/// Kernel source to create a [source](SourceTemplate)
+pub trait KernelSource: Send + 'static + Sync {
+    /// Convert to [source](SourceTemplate)
+    fn source(&self) -> SourceTemplate;
+    /// Identifier for the kernel, used for caching kernel compilation.
+    fn id(&self) -> KernelId;
+    /// The language [`source`](Self::source) is written in, as the compiler for the target tags
+    /// it: `"wgsl"`, `"spirv"`, `"msl"`, `"cpp"`, ...
+    ///
+    /// A template is text the compiler never sees, so nothing can infer this — and nothing can
+    /// translate it either. It is checked against the compiler the runtime selected, and a
+    /// mismatch is a launch error rather than a silent reinterpretation: a wgpu build that picks
+    /// SPIR-V will not run a WGSL template, whatever this says.
+    fn lang(&self) -> &'static str;
+}
+
+#[derive(new)]
+/// Wraps a [kernel source](KernelSource) into a [cube kernel](CubeKernel).
+pub struct SourceKernel<K> {
+    kernel_source: K,
+    cube_dim: CubeDim,
+}
+
+impl<K: KernelSource> CubeKernel for SourceKernel<K> {
+    fn define(&self) -> KernelDefinition {
+        // A source kernel has no expanded IR, the source text is the kernel. The definition only
+        // keys the compilation cache, so the source rides along in the kernel name to keep a
+        // cached artifact from outliving an edit to the template.
+        let settings =
+            KernelSettings::new(self.cube_dim.0, ExecutionMode::Checked, AddressType::U32);
+        KernelDefinition {
+            body: Scope::root(settings.clone()),
+            settings,
+            info: Info::default(),
+        }
+    }
+
+    /// The template's text is already in the target language, so it stands in
+    /// for what the compiler would have produced and `define` is never compiled.
+    fn source(&self) -> Option<PrecompiledSource> {
+        Some(PrecompiledSource {
+            source: self.kernel_source.source().complete(),
+            entrypoint_name: "main".to_string(),
+            lang: self.kernel_source.lang(),
+        })
+    }
+}
+
+impl<K: KernelSource> KernelMetadata for SourceKernel<K> {
+    fn id(&self) -> KernelId {
+        self.kernel_source.id()
+    }
+
+    fn address_type(&self) -> ElemType {
+        UIntKind::U32.into()
+    }
+}
+
+/// Generates kernel source code by replacing some information using templating.
+#[macro_export]
+macro_rules! kernel_source {
+    (
+        $struct:ident,
+        $file:expr
+    ) => {
+        /// Generated kernel from a source file.
+        #[derive(new)]
+        pub struct $struct;
+
+        impl $struct {
+            fn source(&self) -> $crate::template::SourceTemplate {
+                $crate::template::SourceTemplate::new(include_str!($file))
+            }
+        }
+    };
+}
+
+/// Create a vector containing the dimension, strides and shape of tensors.
+///
+/// # Example
+///
+/// With two tensors (lhs, rhs)
+///
+/// | Indexes                  | Value       |
+/// |:------------------------:|:-----------:|
+/// |           0..1           | D           |
+/// |           1..D + 1       | lhs strides |
+/// |     (D + 1)..(2 * D + 1) | rhs strides |
+/// | (2 * D + 1)..(3 * D + 1) | lhs shape   |
+/// | (3 * D + 1)..(4 * D + 1) | rhs shape   |
+pub fn build_info(tensors: &[&CubeTensor]) -> Vec<u32> {
+    let ndims = tensors[0].meta.num_dims();
+    let mut info: Vec<u32> = vec![0; tensors.len() * 2 * ndims + 1];
+    info[0] = ndims as u32;
+
+    let mut current = 1;
+    for tensor in tensors.iter() {
+        for d in 0..ndims {
+            info[current] = tensor.meta.strides()[d] as u32;
+            current += 1;
+        }
+    }
+    for tensor in tensors.iter() {
+        for d in 0..ndims {
+            info[current] = tensor.meta.shape()[d] as u32;
+            current += 1;
+        }
+    }
+    info
+}

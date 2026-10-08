@@ -1,0 +1,456 @@
+use crate::{
+    kernel::utils::{address_type, broadcast_shape},
+    ops::{max_vector_size, numeric::empty_device_dtype},
+    tensor::CubeTensor,
+};
+use burn_backend::cubecl::dtype_to_storage_type;
+use burn_backend::{DType, TensorMetadata};
+use cubecl::{
+    calculate_cube_count_elemwise,
+    prelude::*,
+    std::tensor::layout::linear::{LinearView, LinearViewMut},
+};
+
+#[cube]
+pub(crate) trait ComparisonOpFamily: 'static + Send + Sync {
+    type Operation<T: Numeric, N: Size>: ComparisonOp<T, N>;
+}
+
+#[cube]
+pub(crate) trait ComparisonOp<C: Numeric, N: Size>: 'static + Send + Sync {
+    /// Execute a comparison operation.
+    fn execute(lhs: Vector<C, N>, rhs: Vector<C, N>) -> bool;
+}
+
+struct EqualOp;
+struct NotEqualOp;
+struct GreaterEqualOp;
+struct LowerEqualOp;
+struct GreaterOp;
+struct LowerOp;
+
+impl ComparisonOpFamily for EqualOp {
+    type Operation<T: Numeric, N: Size> = Self;
+}
+
+#[cube]
+impl<T: Numeric, N: Size> ComparisonOp<T, N> for EqualOp {
+    fn execute(lhs: Vector<T, N>, rhs: Vector<T, N>) -> bool {
+        lhs == rhs
+    }
+}
+
+impl ComparisonOpFamily for NotEqualOp {
+    type Operation<T: Numeric, N: Size> = Self;
+}
+
+#[cube]
+impl<T: Numeric, N: Size> ComparisonOp<T, N> for NotEqualOp {
+    fn execute(lhs: Vector<T, N>, rhs: Vector<T, N>) -> bool {
+        lhs != rhs
+    }
+}
+
+impl ComparisonOpFamily for GreaterEqualOp {
+    type Operation<T: Numeric, N: Size> = Self;
+}
+
+#[cube]
+impl<T: Numeric, N: Size> ComparisonOp<T, N> for GreaterEqualOp {
+    fn execute(lhs: Vector<T, N>, rhs: Vector<T, N>) -> bool {
+        lhs >= rhs
+    }
+}
+
+impl ComparisonOpFamily for LowerEqualOp {
+    type Operation<T: Numeric, N: Size> = Self;
+}
+
+#[cube]
+impl<T: Numeric, N: Size> ComparisonOp<T, N> for LowerEqualOp {
+    fn execute(lhs: Vector<T, N>, rhs: Vector<T, N>) -> bool {
+        lhs <= rhs
+    }
+}
+
+impl ComparisonOpFamily for GreaterOp {
+    type Operation<T: Numeric, N: Size> = Self;
+}
+
+#[cube]
+impl<T: Numeric, N: Size> ComparisonOp<T, N> for GreaterOp {
+    fn execute(lhs: Vector<T, N>, rhs: Vector<T, N>) -> bool {
+        lhs > rhs
+    }
+}
+
+impl ComparisonOpFamily for LowerOp {
+    type Operation<T: Numeric, N: Size> = Self;
+}
+
+#[cube]
+impl<T: Numeric, N: Size> ComparisonOp<T, N> for LowerOp {
+    fn execute(lhs: Vector<T, N>, rhs: Vector<T, N>) -> bool {
+        lhs < rhs
+    }
+}
+
+#[cube(launch_unchecked, address_type = "dynamic")]
+pub(crate) fn kernel_scalar_cmp<T: Numeric, Bool: Numeric, N: Size, O: ComparisonOpFamily>(
+    input: LinearView<'_, Vector<T, N>>,
+    scalar: InputScalar,
+    mut output: LinearViewMut<'_, Vector<Bool, N>>,
+    #[define(T, Bool)] _dtypes: [ElemType; 2],
+) {
+    if !output.is_in_bounds(ABSOLUTE_POS) {
+        terminate!();
+    }
+
+    output.write(
+        ABSOLUTE_POS,
+        Vector::cast_from(O::Operation::<T, N>::execute(
+            input.read(ABSOLUTE_POS),
+            Vector::new(scalar.get::<T>()),
+        )),
+    );
+}
+
+#[cube(launch_unchecked, address_type = "dynamic")]
+pub(crate) fn kernel_cmp<T: Numeric, Bool: Numeric, N: Size, O: ComparisonOpFamily>(
+    lhs: LinearView<'_, Vector<T, N>>,
+    rhs: LinearView<'_, Vector<T, N>>,
+    mut out: LinearViewMut<'_, Vector<Bool, N>>,
+    #[define(T, Bool)] _dtype: [ElemType; 2],
+) {
+    if !out.is_in_bounds(ABSOLUTE_POS) {
+        terminate!();
+    }
+
+    out.write(
+        ABSOLUTE_POS,
+        Vector::cast_from(O::Operation::<T, N>::execute(
+            lhs.read(ABSOLUTE_POS),
+            rhs.read(ABSOLUTE_POS),
+        )),
+    );
+}
+
+pub(crate) fn launch_cmp<O: ComparisonOpFamily>(
+    lhs: CubeTensor,
+    rhs: CubeTensor,
+    dtype_bool: DType,
+) -> CubeTensor {
+    let vector_size_lhs = max_vector_size(&lhs);
+    let vector_size_rhs = max_vector_size(&rhs);
+
+    let vector_size = Ord::min(vector_size_lhs, vector_size_rhs);
+
+    let shape_out = broadcast_shape(&[&lhs, &rhs]);
+    let client = lhs.client.clone();
+
+    // A zero-sized broadcast output has no elements to compute, and the in-place/kernel paths
+    // below assume a non-empty output. Return the empty output directly.
+    if shape_out.num_elements() == 0 {
+        return empty_device_dtype(
+            lhs.client.clone(),
+            lhs.device.clone(),
+            shape_out,
+            dtype_bool,
+        );
+    }
+
+    let num_elems = shape_out.num_elements();
+
+    let working_units = num_elems / vector_size as usize;
+    let cube_dim = CubeDim::new(&lhs.client, working_units);
+    let cube_count = calculate_cube_count_elemwise(&lhs.client, working_units, cube_dim);
+
+    let dtypes = [
+        dtype_to_storage_type(lhs.dtype),
+        dtype_to_storage_type(dtype_bool),
+    ];
+    let same_tensor_type = dtypes[0] == dtypes[1];
+    if same_tensor_type && lhs.can_mut_broadcast(&rhs) {
+        unsafe {
+            kernel_cmp::launch_unchecked::<O>(
+                &client,
+                cube_count,
+                cube_dim,
+                address_type!(lhs, rhs),
+                vector_size,
+                lhs.clone().into_linear_view(),
+                rhs.into_linear_view_like(&lhs),
+                lhs.as_linear_view_alias(0),
+                dtypes,
+            );
+        }
+
+        CubeTensor::new(
+            lhs.client.clone(),
+            lhs.handle.clone(),
+            *lhs.meta.clone(),
+            lhs.device.clone(),
+            dtype_bool,
+        )
+    } else if same_tensor_type && rhs.can_mut_broadcast(&lhs) {
+        unsafe {
+            kernel_cmp::launch_unchecked::<O>(
+                &client,
+                cube_count,
+                cube_dim,
+                address_type!(lhs, rhs),
+                vector_size,
+                lhs.into_linear_view_like(&rhs),
+                rhs.clone().into_linear_view(),
+                rhs.as_linear_view_alias(1),
+                dtypes,
+            );
+        };
+
+        CubeTensor::new(
+            rhs.client.clone(),
+            rhs.handle.clone(),
+            *rhs.meta.clone(),
+            rhs.device.clone(),
+            dtype_bool,
+        )
+    } else {
+        let output = empty_device_dtype(
+            lhs.client.clone(),
+            lhs.device.clone(),
+            shape_out,
+            dtype_bool,
+        );
+
+        unsafe {
+            kernel_cmp::launch_unchecked::<O>(
+                &client,
+                cube_count,
+                cube_dim,
+                address_type!(lhs, rhs, output),
+                vector_size,
+                lhs.into_linear_view_like(&output),
+                rhs.into_linear_view_like(&output),
+                output.clone().into_linear_view(),
+                dtypes,
+            );
+        };
+
+        output
+    }
+}
+
+pub(crate) fn launch_scalar_cmp<O: ComparisonOpFamily>(
+    tensor: CubeTensor,
+    scalar: InputScalar,
+    dtype_bool: DType,
+) -> CubeTensor {
+    let vector_size = max_vector_size(&tensor);
+    let client = tensor.client.clone();
+    let num_elems = tensor.meta.num_elements();
+
+    let working_units = num_elems / vector_size as usize;
+    let cube_dim = CubeDim::new(&tensor.client, working_units);
+    let cube_count = calculate_cube_count_elemwise(&tensor.client, working_units, cube_dim);
+
+    let dtypes = [
+        dtype_to_storage_type(tensor.dtype),
+        dtype_to_storage_type(dtype_bool),
+    ];
+    let same_tensor_type = dtypes[0] == dtypes[1];
+
+    if same_tensor_type && tensor.can_mut() && tensor.is_nonoverlapping() {
+        unsafe {
+            kernel_scalar_cmp::launch_unchecked::<O>(
+                &client,
+                cube_count,
+                cube_dim,
+                address_type!(tensor),
+                vector_size,
+                tensor.clone().into_linear_view(),
+                scalar,
+                tensor.as_linear_view_alias(0),
+                dtypes,
+            );
+        }
+
+        CubeTensor::new(
+            tensor.client.clone(),
+            tensor.handle.clone(),
+            *tensor.meta.clone(),
+            tensor.device.clone(),
+            dtype_bool,
+        )
+    } else {
+        let output = empty_device_dtype(
+            tensor.client.clone(),
+            tensor.device.clone(),
+            tensor.shape(),
+            dtype_bool,
+        );
+
+        unsafe {
+            kernel_scalar_cmp::launch_unchecked::<O>(
+                &client,
+                cube_count,
+                cube_dim,
+                address_type!(tensor, output),
+                vector_size,
+                tensor.into_linear_view(),
+                scalar,
+                output.clone().into_linear_view(),
+                dtypes,
+            );
+        }
+
+        output
+    }
+}
+
+pub fn equal(lhs: CubeTensor, rhs: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_cmp::<EqualOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn not_equal(lhs: CubeTensor, rhs: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_cmp::<NotEqualOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn greater(lhs: CubeTensor, rhs: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_cmp::<GreaterOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn greater_equal(lhs: CubeTensor, rhs: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_cmp::<GreaterEqualOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn lower(lhs: CubeTensor, rhs: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_cmp::<LowerOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn lower_equal(lhs: CubeTensor, rhs: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_cmp::<LowerEqualOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn equal_elem(lhs: CubeTensor, rhs: InputScalar, dtype_bool: DType) -> CubeTensor {
+    launch_scalar_cmp::<EqualOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn not_equal_elem(lhs: CubeTensor, rhs: InputScalar, dtype_bool: DType) -> CubeTensor {
+    launch_scalar_cmp::<NotEqualOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn greater_elem(lhs: CubeTensor, rhs: InputScalar, dtype_bool: DType) -> CubeTensor {
+    launch_scalar_cmp::<GreaterOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn lower_elem(lhs: CubeTensor, rhs: InputScalar, dtype_bool: DType) -> CubeTensor {
+    launch_scalar_cmp::<LowerOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn greater_equal_elem(lhs: CubeTensor, rhs: InputScalar, dtype_bool: DType) -> CubeTensor {
+    launch_scalar_cmp::<GreaterEqualOp>(lhs, rhs, dtype_bool)
+}
+
+pub fn lower_equal_elem(lhs: CubeTensor, rhs: InputScalar, dtype_bool: DType) -> CubeTensor {
+    launch_scalar_cmp::<LowerEqualOp>(lhs, rhs, dtype_bool)
+}
+
+// Unary comparison / predicate / relational ops
+
+#[cube]
+pub(crate) trait PredicateOp<F: Float, N: Size>: 'static + Send + Sync {
+    /// Execute a predicate operation.
+    fn execute(input: Vector<F, N>) -> Vector<bool, N>;
+}
+
+pub(crate) trait PredicateOpFamily: 'static + Send + Sync {
+    type Operation<F: Float, N: Size>: PredicateOp<F, N>;
+}
+
+struct IsNanOp;
+struct IsInfOp;
+
+impl PredicateOpFamily for IsNanOp {
+    type Operation<F: Float, N: Size> = Self;
+}
+
+#[cube]
+impl<F: Float, N: Size> PredicateOp<F, N> for IsNanOp {
+    fn execute(input: Vector<F, N>) -> Vector<bool, N> {
+        Vector::is_nan(input)
+    }
+}
+
+impl PredicateOpFamily for IsInfOp {
+    type Operation<F: Float, N: Size> = Self;
+}
+#[cube]
+impl<F: Float, N: Size> PredicateOp<F, N> for IsInfOp {
+    fn execute(input: Vector<F, N>) -> Vector<bool, N> {
+        Vector::is_inf(input)
+    }
+}
+
+#[cube(launch_unchecked, address_type = "dynamic")]
+pub(crate) fn kernel_predicate<F: Float, Bool: Numeric, N: Size, O: PredicateOpFamily>(
+    input: LinearView<'_, Vector<F, N>>,
+    mut output: LinearViewMut<'_, Vector<Bool, N>>,
+    #[define(F, Bool)] _dtypes: [ElemType; 2],
+) {
+    if !output.is_in_bounds(ABSOLUTE_POS) {
+        terminate!();
+    }
+
+    output.write(
+        ABSOLUTE_POS,
+        Vector::cast_from(O::Operation::<F, N>::execute(input.read(ABSOLUTE_POS))),
+    );
+}
+
+pub(crate) fn launch_predicate<O: PredicateOpFamily>(
+    tensor: CubeTensor,
+    dtype_bool: DType,
+) -> CubeTensor {
+    let vector_size = max_vector_size(&tensor);
+
+    let client = tensor.client.clone();
+    let num_elems = tensor.meta.num_elements();
+
+    let dtypes = [
+        dtype_to_storage_type(tensor.dtype),
+        dtype_to_storage_type(dtype_bool),
+    ];
+    let working_units = num_elems / vector_size as usize;
+    let cube_dim = CubeDim::new(&tensor.client, working_units);
+    let cube_count = calculate_cube_count_elemwise(&tensor.client, working_units, cube_dim);
+
+    let output = empty_device_dtype(
+        tensor.client.clone(),
+        tensor.device.clone(),
+        tensor.shape(),
+        dtype_bool,
+    );
+
+    unsafe {
+        kernel_predicate::launch_unchecked::<O>(
+            &client,
+            cube_count,
+            cube_dim,
+            address_type!(tensor, output),
+            vector_size,
+            tensor.into_linear_view_like(&output),
+            output.clone().into_linear_view(),
+            dtypes,
+        );
+    }
+
+    output
+}
+
+pub fn is_nan(tensor: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_predicate::<IsNanOp>(tensor, dtype_bool)
+}
+
+pub fn is_inf(tensor: CubeTensor, dtype_bool: DType) -> CubeTensor {
+    launch_predicate::<IsInfOp>(tensor, dtype_bool)
+}

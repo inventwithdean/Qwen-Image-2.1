@@ -5,7 +5,7 @@ use burn::{
     nn::{Linear, LinearConfig},
     tensor::{
         Bool, Device, FloatDType, Int,
-        activation::{gelu_approximate, silu, softmax},
+        activation::{gelu_approximate, silu},
         module::attention,
         ops::AttentionModuleOptions,
         s,
@@ -242,10 +242,13 @@ struct QwenImageSwiGLUFeedForward {
 }
 
 impl QwenImageSwiGLUFeedForward {
+    // Doing compute in F16
     fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
+        let hidden_states = hidden_states.cast(FloatDType::F16);
         let gate_out = silu(self.gate_layer.forward(hidden_states.clone()));
         let other = self.proj.forward(hidden_states);
-        self.out.forward(gate_out * other)
+
+        self.out.forward(gate_out * other).cast(FloatDType::F32)
     }
 }
 
@@ -363,12 +366,11 @@ impl QwenImageAdaLayerNormContinuousConfig {
 }
 
 pub fn qwenimage_prefix_segments(
-    image_ids: Tensor<1, Int>,
+    image_ids: &[i64],
     prefix_len: usize,
 ) -> Vec<(usize, usize, bool)> {
     // image_ids: (seq_len,)
-    let prefix_ids = image_ids.slice(s![0..prefix_len]); // (prefix_len,)
-    let prefix_ids = prefix_ids.into_data().iter::<i64>().collect::<Vec<i64>>();
+    let prefix_ids = &image_ids[0..prefix_len];
 
     let mut segments = vec![];
     let mut start = 0;
@@ -457,6 +459,7 @@ fn qwen_attention(
     ); // (B, H, S, D)
     return out.swap_dims(1, 2); // (B, S, H, D)
 
+    /*
     let head_dim = query.dims()[3] as f64;
     let scale = 1.0 / head_dim.sqrt();
 
@@ -478,6 +481,7 @@ fn qwen_attention(
     // (B, H, S, S) @ (B, H, S, D) => (B, H, S, D)
     let context = weights.matmul(value); //.cast(initial_dtype);
     context.swap_dims(1, 2) //(B, S, H, D)
+     */
 }
 
 impl QwenImageAttention {
@@ -729,13 +733,9 @@ impl QwenImageRope {
     pub fn forward(
         &self,
         img_shapes: Vec<(usize, usize, usize)>,
-        image_pad_mask: Tensor<1, Bool>,
+        is_image_token: &[bool],
+        device: &Device,
     ) -> (Tensor<2>, Tensor<2>) {
-        let device = &image_pad_mask.device();
-        let is_image_token = image_pad_mask
-            .into_data()
-            .iter::<bool>()
-            .collect::<Vec<bool>>();
         let total_len = is_image_token.len();
 
         let mut frame_index = Vec::with_capacity(total_len);
