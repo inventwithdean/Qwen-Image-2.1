@@ -9,8 +9,8 @@ use burn::{
     tensor::{
         Device,
         activation::silu,
-        module::{attention, interpolate},
-        ops::{AttentionModuleOptions, InterpolateMode, InterpolateOptions, PadMode},
+        module::{attention, conv2d, interpolate},
+        ops::{AttentionModuleOptions, ConvOptions, InterpolateMode, InterpolateOptions, PadMode},
         s,
     },
 };
@@ -106,7 +106,7 @@ pub struct QwenImageDupUp3D {
 }
 
 impl QwenImageDupUp3D {
-    pub fn forward(&self, x: Tensor<5>, first_chunk: bool) -> Tensor<5> {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
         let [b, c, t, h, w] = x.dims();
 
         let x = x
@@ -131,11 +131,7 @@ impl QwenImageDupUp3D {
         let new_w = w * self.factor_s;
         let x = x.reshape([b, self.out_channels, new_t, new_h, new_w]);
 
-        if first_chunk {
-            x.slice(s![.., .., self.factor_t - 1.., .., ..])
-        } else {
-            x
-        }
+        x.slice(s![.., .., self.factor_t - 1.., .., ..])
     }
 }
 
@@ -166,16 +162,22 @@ impl QwenImageDupUp3DConfig {
 
 #[derive(Module, Debug)]
 pub struct QwenImageCausalConv3D {
-    pub conv2d: Conv2d,
+    pub weight: Param<Tensor<4>>,
+    pub bias: Param<Tensor<1>>,
+    stride: [usize; 2],
     padding: [usize; 2],
 }
 
 impl QwenImageCausalConv3D {
     pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
         let x = x.squeeze_dim::<4>(2); // (B, C, H, W)
-        let [pad_h, pad_w] = self.padding;
-        let x = x.pad([(pad_h, pad_h), (pad_w, pad_w)], PadMode::Constant(0.0));
-        let x = self.conv2d.forward(x);
+        let x = conv2d(
+            x,
+            self.weight.val(),
+            Some(self.bias.val()),
+            ConvOptions::new(self.stride, self.padding, [1, 1], 1),
+        );
+
         x.unsqueeze_dim(2)
     }
 }
@@ -197,65 +199,67 @@ impl QwenImageCausalConv3DConfig {
             .with_stride(self.stride)
             .init(device);
         QwenImageCausalConv3D {
-            conv2d,
+            weight: conv2d.weight,
+            bias: conv2d.bias.expect("Conv2d bias is enabled by default"),
+            stride: self.stride,
             padding: self.padding,
         }
     }
 }
 
-#[derive(Module, Debug)]
-pub struct QwenImageRMSNorm {
-    gamma: Param<Tensor<1>>,
-    bias: Option<Param<Tensor<1>>>,
-    scale: f32,
-    dim: usize,
+fn rms_normalize<const D: usize>(x: Tensor<D>, scale: f32) -> Tensor<D> {
+    let norm = x.clone().square().sum_dim(1).sqrt().clamp_min(1e-12);
+    x / norm * scale
 }
 
-impl QwenImageRMSNorm {
-    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
-        let norm = x
-            .clone()
-            .powf_scalar(2.0)
-            .sum_dim(1)
-            .sqrt()
-            .clamp_min(1e-12);
-        let mut out = (x / norm) * self.scale;
+#[derive(Module, Debug)]
+pub struct QwenImageRMSNorm3D {
+    gamma: Param<Tensor<4>>,
+    scale: f32,
+}
 
-        let mut shape = [1; D]; // If D=5, [1, dim, 1, 1, 1]
-        shape[1] = self.dim;
-
-        let gamma = self.gamma.val().reshape(shape);
-        out = out * gamma;
-        if let Some(bias) = &self.bias {
-            let bias = bias.val().reshape(shape);
-            out = out + bias;
-        }
-        out
+impl QwenImageRMSNorm3D {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
+        rms_normalize(x, self.scale) * self.gamma.val().unsqueeze::<5>()
     }
 }
 
 #[derive(Config, Debug)]
-pub struct QwenImageRMSNormConfig {
-    pub dim: usize,
-    #[config(default = false)]
-    pub bias: bool,
+pub struct QwenImageRMSNorm3DConfig {
+    dim: usize,
 }
 
-impl QwenImageRMSNormConfig {
-    pub fn init(&self, device: &Device) -> QwenImageRMSNorm {
-        let scale = (self.dim as f32).sqrt();
-        let gamma = Param::from_tensor(Tensor::ones([self.dim], device));
-        let bias = if self.bias {
-            Some(Param::from_tensor(Tensor::zeros([self.dim], device)))
-        } else {
-            None
-        };
+impl QwenImageRMSNorm3DConfig {
+    pub fn init(&self, device: &Device) -> QwenImageRMSNorm3D {
+        QwenImageRMSNorm3D {
+            gamma: Param::from_tensor(Tensor::ones([self.dim, 1, 1, 1], device)),
+            scale: (self.dim as f32).sqrt(),
+        }
+    }
+}
 
-        QwenImageRMSNorm {
-            gamma,
-            bias,
-            scale,
-            dim: self.dim,
+#[derive(Module, Debug)]
+pub struct QwenImageRMSNorm2D {
+    gamma: Param<Tensor<3>>,
+    scale: f32,
+}
+
+impl QwenImageRMSNorm2D {
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        rms_normalize(x, self.scale) * self.gamma.val().unsqueeze::<4>()
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct QwenImageRMSNorm2DConfig {
+    dim: usize,
+}
+
+impl QwenImageRMSNorm2DConfig {
+    pub fn init(&self, device: &Device) -> QwenImageRMSNorm2D {
+        QwenImageRMSNorm2D {
+            gamma: Param::from_tensor(Tensor::ones([self.dim, 1, 1], device)),
+            scale: (self.dim as f32).sqrt(),
         }
     }
 }
@@ -283,7 +287,7 @@ impl QwenImageUpsampleConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-enum ResampleMode {
+pub enum ResampleMode {
     Upsample2D,
     Upsample3D,
     Downsample2D,
@@ -358,9 +362,9 @@ impl QwenImageResampleConfig {
 
 #[derive(Module, Debug)]
 pub struct QwenImageResidualBlock {
-    norm1: QwenImageRMSNorm,
+    norm1: QwenImageRMSNorm3D,
     conv1: QwenImageCausalConv3D,
-    norm2: QwenImageRMSNorm,
+    norm2: QwenImageRMSNorm3D,
     conv2: QwenImageCausalConv3D,
     conv_shortcut: Option<QwenImageCausalConv3D>,
 }
@@ -398,11 +402,11 @@ impl QwenImageResidualBlockConfig {
             None
         };
         QwenImageResidualBlock {
-            norm1: QwenImageRMSNormConfig::new(self.in_dim).init(device),
+            norm1: QwenImageRMSNorm3DConfig::new(self.in_dim).init(device),
             conv1: QwenImageCausalConv3DConfig::new(self.in_dim, self.out_dim, [3, 3])
                 .with_padding([1, 1])
                 .init(device),
-            norm2: QwenImageRMSNormConfig::new(self.out_dim).init(device),
+            norm2: QwenImageRMSNorm3DConfig::new(self.out_dim).init(device),
             conv2: QwenImageCausalConv3DConfig::new(self.out_dim, self.out_dim, [3, 3])
                 .with_padding([1, 1])
                 .init(device),
@@ -413,7 +417,7 @@ impl QwenImageResidualBlockConfig {
 
 #[derive(Module, Debug)]
 pub struct QwenImageAttentionBlock {
-    norm: QwenImageRMSNorm,
+    norm: QwenImageRMSNorm2D,
     to_qkv: Conv2d,
     proj: Conv2d,
 }
@@ -459,7 +463,7 @@ pub struct QwenImageAttentionBlockConfig {
 impl QwenImageAttentionBlockConfig {
     pub fn init(&self, device: &Device) -> QwenImageAttentionBlock {
         QwenImageAttentionBlock {
-            norm: QwenImageRMSNormConfig::new(self.dim).init(device),
+            norm: QwenImageRMSNorm2DConfig::new(self.dim).init(device),
             to_qkv: Conv2dConfig::new([self.dim, self.dim * 3], [1, 1]).init(device),
             proj: Conv2dConfig::new([self.dim, self.dim], [1, 1]).init(device),
         }
@@ -582,7 +586,7 @@ pub struct QwenImageResidualUpBlock {
 }
 
 impl QwenImageResidualUpBlock {
-    pub fn forward(&self, x: Tensor<5>, first_chunk: bool) -> Tensor<5> {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
         // x: (B, C, T, H, W)
         let x_copy = x.clone();
         let mut x = x;
@@ -595,7 +599,7 @@ impl QwenImageResidualUpBlock {
         }
 
         if let Some(avg_shortcut) = &self.avg_shortcut {
-            x = x + avg_shortcut.forward(x_copy, first_chunk);
+            x = x + avg_shortcut.forward(x_copy);
         }
         x
     }
