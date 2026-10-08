@@ -292,7 +292,7 @@ enum ResampleMode {
 
 // We don't need time_conv
 #[derive(Module, Debug)]
-struct QwenImageResample {
+pub struct QwenImageResample {
     resample: (Option<QwenImageUpsample>, Conv2d),
 }
 
@@ -517,6 +517,7 @@ pub struct QwenImageResidualDownBlock {
 
 impl QwenImageResidualDownBlock {
     pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
+        // x: (B, C, T, H, W)
         let x_copy = x.clone();
         let mut x = x;
         for resnet in &self.resnets {
@@ -569,6 +570,135 @@ impl QwenImageResidualDownBlockConfig {
                 .init(),
             resnets,
             downsampler,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct QwenImageResidualUpBlock {
+    avg_shortcut: Option<QwenImageDupUp3D>,
+    resnets: Vec<QwenImageResidualBlock>,
+    upsampler: Option<QwenImageResample>,
+}
+
+impl QwenImageResidualUpBlock {
+    pub fn forward(&self, x: Tensor<5>, first_chunk: bool) -> Tensor<5> {
+        // x: (B, C, T, H, W)
+        let x_copy = x.clone();
+        let mut x = x;
+        for resnet in &self.resnets {
+            x = resnet.forward(x);
+        }
+
+        if let Some(upsampler) = &self.upsampler {
+            x = upsampler.forward(x);
+        }
+
+        if let Some(avg_shortcut) = &self.avg_shortcut {
+            x = x + avg_shortcut.forward(x_copy, first_chunk);
+        }
+        x
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct QwenImageResidualUpBlockConfig {
+    in_dim: usize,
+    out_dim: usize,
+    num_res_blocks: usize,
+    #[config(default = false)]
+    temporal_upsample: bool,
+    #[config(default = false)]
+    up_flag: bool,
+}
+
+impl QwenImageResidualUpBlockConfig {
+    pub fn init(&self, device: &Device) -> QwenImageResidualUpBlock {
+        let factor_t = if self.temporal_upsample { 2 } else { 1 };
+        let factor_s = 2;
+        let avg_shortcut = match self.up_flag {
+            true => Some(
+                QwenImageDupUp3DConfig::new(self.in_dim, self.out_dim, factor_t)
+                    .with_factor_s(factor_s)
+                    .init(),
+            ),
+            false => None,
+        };
+        let mut resnets = vec![];
+        let mut current_dim = self.in_dim;
+        for _ in 0..self.num_res_blocks + 1 {
+            resnets.push(QwenImageResidualBlockConfig::new(current_dim, self.out_dim).init(device));
+            current_dim = self.out_dim;
+        }
+
+        let upsampler = match self.up_flag {
+            true => {
+                let mode = if self.temporal_upsample {
+                    ResampleMode::Upsample3D
+                } else {
+                    ResampleMode::Upsample2D
+                };
+                Some(
+                    QwenImageResampleConfig::new(self.out_dim, mode)
+                        .with_upsample_out_dim(Some(self.out_dim))
+                        .init(device),
+                )
+            }
+            false => None,
+        };
+        QwenImageResidualUpBlock {
+            avg_shortcut,
+            resnets,
+            upsampler,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct QwenImageUpBlock {
+    resnets: Vec<QwenImageResidualBlock>,
+    upsamplers: Option<Vec<QwenImageResample>>, // Either None or ModuleList() containing exactly one Resample
+}
+
+impl QwenImageUpBlock {
+    pub fn forward(&self, x: Tensor<5>) -> Tensor<5> {
+        let mut x = x;
+        for resnet in &self.resnets {
+            x = resnet.forward(x);
+        }
+
+        if let Some(upsamplers) = &self.upsamplers {
+            x = upsamplers[0].forward(x);
+        }
+        x
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct QwenImageUpBlockConfig {
+    in_dim: usize,
+    out_dim: usize,
+    num_res_blocks: usize,
+    upsample_mode: Option<ResampleMode>,
+}
+
+impl QwenImageUpBlockConfig {
+    pub fn init(&self, device: &Device) -> QwenImageUpBlock {
+        let mut resnets = vec![];
+        let mut current_dim = self.in_dim;
+        for _ in 0..self.num_res_blocks + 1 {
+            resnets.push(QwenImageResidualBlockConfig::new(current_dim, self.out_dim).init(device));
+            current_dim = self.out_dim;
+        }
+        let upsamplers = match &self.upsample_mode {
+            Some(mode) => Some(vec![
+                QwenImageResampleConfig::new(self.out_dim, mode.clone()).init(device),
+            ]),
+            None => None,
+        };
+        QwenImageUpBlock {
+            resnets,
+            upsamplers,
         }
     }
 }
