@@ -17,27 +17,17 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 
 ## Features
 - Runs on any GPU (wgpu backend).
+- Supports WebGPU.
 - int8 block quantized transformer Blocks.
-- RAM Layer Streaming for Low VRAM usage.
-
-## Speed Test
-
-| Resolution | Batch Size | Time Taken | Peak VRAM
-| --- | --- | --- | --- |
-| 512 x 512 | 1 | 74 sec | ~2.2 GB
-| 768 x 768 | 1 | 115 sec | ~4.2 GB
-| 1024 x 1024 | 1 | 187 sec  | ~5.2 GB
-| 512 x 512 | 4 | 176 sec | ~6.2 GB
-
-#### Tested on cuda backend (BF16) on an RTX 4060Ti 8GB w/ 25 steps.
+- Disk Layer Streaming for Low VRAM usage.
 
 ## Components
 - DiT (Completed)
-- VAE (TODO)
+- VAE (Completed)
 - Text Encoder (TODO)
 
 ## Flash Attention
-Flash attention doesn't require materializing full N x N matrix hence saving us a lot of VRAM. Available only on supported backends.
+Flash attention (used in DiT) doesn't require materializing full N x N matrix hence saving us a lot of VRAM.
 
 ## License
 
