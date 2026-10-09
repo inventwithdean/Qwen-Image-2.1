@@ -170,3 +170,85 @@ impl QwenImageDecoder3DConfig {
         }
     }
 }
+
+#[derive(Module, Debug)]
+pub struct AutoencoderKLQwenImage {
+    encoder: QwenImageEncoder3D,
+    quant_conv: QwenImageCausalConv3D,
+    post_quant_conv: QwenImageCausalConv3D,
+    decoder: QwenImageDecoder3D,
+}
+
+impl AutoencoderKLQwenImage {
+    pub fn encode(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+        // x: (B, C, H, W)
+        let out = self.encoder.forward(x.unsqueeze_dim::<5>(2)); // (B, C, T, H, W)
+        let moments = self.quant_conv.forward(out).squeeze_dim::<4>(2); // (B, C, H, W)
+        let z = moments.dims()[1] / 2;
+        let mean = moments.clone().narrow(1, 0, z);
+        let logvar = moments.narrow(1, z, z);
+        (mean, logvar)
+    }
+
+    pub fn decode(&self, z: Tensor<4>) -> Tensor<4> {
+        let h = self.post_quant_conv.forward(z.unsqueeze_dim::<5>(2));
+        self.decoder.forward(h).squeeze_dim::<4>(2).clamp(-1.0, 1.0)
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct AutoencoderKLQwenImageConfig {
+    #[config(default = 96)]
+    base_dim: usize,
+    #[config(default = 144)]
+    decoder_base_dim: usize,
+    #[config(default = 64)]
+    z_dim: usize,
+    #[config(default = "vec![1, 2, 4, 8, 8]")]
+    dim_mult: Vec<usize>,
+    #[config(default = 2)]
+    num_res_blocks: usize,
+    #[config(default = "vec![false, true, true, true]")]
+    temporal_downsample: Vec<bool>,
+    #[config(default = 4)]
+    in_channels: usize,
+    #[config(default = 4)]
+    out_channels: usize,
+}
+
+impl AutoencoderKLQwenImageConfig {
+    pub fn init(&self, device: &Device) -> AutoencoderKLQwenImage {
+        let encoder = QwenImageEncoder3DConfig::new(
+            self.in_channels,
+            self.base_dim,
+            self.z_dim * 2,
+            self.dim_mult.clone(),
+            self.num_res_blocks,
+            self.temporal_downsample.clone(),
+        )
+        .init(device);
+        let quant_conv =
+            QwenImageCausalConv3DConfig::new(self.z_dim * 2, self.z_dim * 2, [1, 1]).init(device);
+        let post_quant_conv =
+            QwenImageCausalConv3DConfig::new(self.z_dim, self.z_dim, [1, 1]).init(device);
+
+        let mut temporal_upsample = self.temporal_downsample.clone();
+        temporal_upsample.reverse();
+        let decoder = QwenImageDecoder3DConfig::new(
+            self.decoder_base_dim,
+            self.z_dim,
+            self.dim_mult.clone(),
+            self.num_res_blocks,
+            temporal_upsample,
+            self.out_channels,
+        )
+        .init(device);
+
+        AutoencoderKLQwenImage {
+            encoder,
+            quant_conv,
+            post_quant_conv,
+            decoder,
+        }
+    }
+}
