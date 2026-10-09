@@ -11,6 +11,7 @@ burn = { version = "0.22", features = ["std", "wgpu", "fusion"], default-feature
 burn-store = "0.22"
 console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
+image = "0.25.10"
 js-sys = "0.3.106"
 safetensors = "0.8.0"
 serde = "1.0.229"

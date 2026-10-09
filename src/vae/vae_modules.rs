@@ -437,7 +437,13 @@ impl QwenImageAttentionBlock {
         );
         // Each of q, k and v is now (B * T, 1, H * W, C)
         // expects (batch_size, num_heads, seq_len, head_dim)
-        let x = attention(q, k, v, None, None, AttentionModuleOptions::default());
+        // The vendored dispatch checks options.scale.is_some() before any strategy is chosen
+        // and routes straight to attention_fallback. So the VAE now runs the naive attention
+        // We're just making implicit math explicit, no difference numerically, just routing to naive
+        // as flash attention doesn't run here, it's just a single attention head.
+        let mut attn_options = AttentionModuleOptions::default();
+        attn_options.scale = Some(1.0 / (c as f64).sqrt());
+        let x = attention(q, k, v, None, None, attn_options);
         let x = x.squeeze_dim::<3>(1); // (B * T, H * W, C)
         let x = x.permute([0, 2, 1]); // (B * T, C, H * W)
         let x = x.reshape([b * t, c, h, w]); // (B * T, C, H, W)

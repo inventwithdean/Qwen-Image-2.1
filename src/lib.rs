@@ -6,7 +6,7 @@ pub mod vae;
 use burn::{
     module::Module,
     store::ModuleRecord,
-    tensor::{Bytes, Device, Distribution, FloatDType, Tensor, s},
+    tensor::{Bytes, Device, Distribution, FloatDType, Tensor, TensorData, s},
 };
 use qwen_image::{
     QwenImageBlockStreamerWeb, QwenImageTransformerModel, QwenImageTransformerModelConfig,
@@ -14,6 +14,8 @@ use qwen_image::{
 };
 use qwen_image_modules::{KvCacheMode, QwenImageKVCache};
 use wasm_bindgen::prelude::*;
+
+use crate::vae::model::{AutoencoderKLQwenImage, AutoencoderKLQwenImageConfig};
 
 #[wasm_bindgen]
 extern "C" {
@@ -49,8 +51,65 @@ fn schedule(steps: usize, seq_len: usize) -> Vec<f32> {
 pub struct QwenWeb {
     model: Option<QwenImageTransformerModel>,
     streamer: Option<QwenImageBlockStreamerWeb>,
+    vae: Option<AutoencoderKLQwenImage>,
     device: Option<Device>,
 }
+
+pub struct LatentNorm {
+    mean: Tensor<4>, // (1, 64, 1, 1)
+    std: Tensor<4>,
+}
+
+impl LatentNorm {
+    pub fn new(mean: &[f32], std: &[f32], device: &Device) -> Self {
+        let make = |v: &[f32]| {
+            Tensor::<4>::from_data(TensorData::new(v.to_vec(), [1, v.len(), 1, 1]), device)
+        };
+        Self {
+            mean: make(mean),
+            std: make(std),
+        }
+    }
+
+    /// diffusion-space latents -> VAE-space (use before decode)
+    pub fn denormalize(&self, z: Tensor<4>) -> Tensor<4> {
+        z * self.std.clone() + self.mean.clone()
+    }
+
+    /// VAE-space latents -> diffusion-space (use after encode)
+    pub fn normalize(&self, z: Tensor<4>) -> Tensor<4> {
+        (z - self.mean.clone()) / self.std.clone()
+    }
+}
+
+const LATENT_H: usize = 32;
+const LATENT_W: usize = 32;
+
+#[wasm_bindgen]
+pub struct DecodedImage {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl DecodedImage {
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+    /// Uint8ClampedArray, ready for `new ImageData(...)`
+    #[wasm_bindgen(getter)]
+    pub fn rgba(&self) -> js_sys::Uint8ClampedArray {
+        js_sys::Uint8ClampedArray::from(self.rgba.as_slice())
+    }
+}
+
+impl QwenWeb {}
 
 #[wasm_bindgen]
 impl QwenWeb {
@@ -60,20 +119,41 @@ impl QwenWeb {
         QwenWeb {
             model: None,
             streamer: None,
+            vae: None,
             device: None,
         }
     }
 
-    /// Init WebGPU, build the layer-less model shell, and prepare the streamer.
-    pub async fn load_shell(&mut self, shell_bytes: &[u8]) -> Result<(), JsValue> {
-        log("1. Starting async load. Requesting WebGPU Adapter...");
+    fn load_vae(&mut self, vae_bytes: Vec<u8>) -> Result<(), JsValue> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Call load_shell first!"))?;
+        let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(vae_bytes))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.vae = Some(
+            AutoencoderKLQwenImageConfig::new()
+                .init(device)
+                .load_record(record),
+        );
+        Ok(())
+    }
 
+    pub async fn init_device(&mut self) -> Result<(), JsValue> {
+        log("Initializing Device...");
         let device = Device::wgpu_options()
             .init_async()
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.device = Some(device);
+        log("Device initialized successfully!");
+        Ok(())
+    }
 
-        log("2. WebGPU Initialized. Parsing shell record...");
+    /// Init WebGPU, build the layer-less model shell, and prepare the streamer.
+    pub async fn load_shell(&mut self, shell_bytes: &[u8]) -> Result<(), JsValue> {
+        log("Loading DiT shell...");
+        let device = self.device.as_ref().expect("Call init_device first!");
         let config = QwenImageTransformerModelConfig::new([16, 56, 56]);
         let mut model = config.clone().with_num_layers(0).init(&device);
 
@@ -81,11 +161,11 @@ impl QwenWeb {
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         model = model.load_record(shell_record);
 
+        log("Preparing Transformer Block Streamer...");
         let streamer = QwenImageBlockStreamerWeb::new_empty(&config, &device);
 
         self.model = Some(model);
         self.streamer = Some(streamer);
-        self.device = Some(device);
         Ok(())
     }
 
@@ -120,31 +200,34 @@ impl QwenWeb {
         }
     }
 
-    pub async fn probe_f16(&self) -> Result<String, JsValue> {
-        let device = self.device.as_ref().ok_or("no device")?;
-        let a = Tensor::<2>::random([256, 16384], Distribution::Normal(0.0, 1.0), device);
-        let b = Tensor::<2>::random([16384, 256], Distribution::Normal(0.0, 1.0), device);
-        let r32 = a.clone().matmul(b.clone());
-        let r16 = a
-            .cast(FloatDType::F16)
-            .matmul(b.cast(FloatDType::F16))
-            .cast(FloatDType::F32);
-        let err = (r16 - r32.clone()).abs().max() / r32.abs().max();
-        let v = err
-            .into_data_async()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?
-            .try_into_vec::<f32>()
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(format!("max relative error: {:e}", v[0]))
+    pub fn release_vae(&mut self) {
+        self.vae = None;
+        self.device
+            .as_ref()
+            .expect("No device found!")
+            .memory_cleanup();
     }
 
+    pub fn release_dit(&mut self) {
+        self.close_blocks();
+        self.model = None;
+        self.streamer = None;
+        self.device
+            .as_ref()
+            .expect("No device found!")
+            .memory_cleanup();
+    }
+}
+
+#[wasm_bindgen]
+impl QwenWeb {
     pub async fn generate(
         &mut self,
         prompt_floats: &[f32],
+        h: usize,
+        w: usize,
+        num_steps: usize, // Number of steps
     ) -> Result<js_sys::Float32Array, JsValue> {
-        let res = self.probe_f16().await?;
-        log(&res);
         let model = self
             .model
             .as_ref()
@@ -157,7 +240,6 @@ impl QwenWeb {
         }
 
         let t_text = prompt_floats.len() / 4096;
-        let (h, w) = (32_usize, 32_usize);
         let batch_size = 1;
         let target_tokens = h * w;
         let slots = target_tokens / 4;
@@ -174,12 +256,11 @@ impl QwenWeb {
         )
         .cast(FloatDType::F32);
 
-        let steps = 25;
-        let sigmas: Vec<f32> = schedule(steps, target_tokens);
+        let sigmas: Vec<f32> = schedule(num_steps, target_tokens);
 
         let mut kv_cache = QwenImageKVCache::new(streamer.num_layers, batch_size, device);
 
-        for step in 0..steps {
+        for step in 0..num_steps {
             let mode = if step == 0 {
                 KvCacheMode::EXTRACT
             } else {
@@ -219,14 +300,64 @@ impl QwenWeb {
             log(&format!("Completed step {}", step + 1));
         }
 
-        let final_data = latents
+        let data = latents
             .cast(FloatDType::F32)
             .into_data_async()
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?
             .try_into_vec::<f32>()
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(js_sys::Float32Array::from(data.as_slice()))
+    }
 
-        Ok(js_sys::Float32Array::from(final_data.as_slice()))
+    pub async fn decode_latents(
+        &mut self,
+        latents: &[f32],    // (1, h*w, 64) straight from generate
+        vae_bytes: Vec<u8>, // ignored if a VAE is already loaded via load_vae
+        h: usize,           // latent height
+        w: usize,           // latent width
+    ) -> Result<DecodedImage, JsValue> {
+        log("Loading VAE");
+        if self.vae.is_none() {
+            self.load_vae(vae_bytes)?;
+        }
+        log("Loaded VAE!");
+        let vae = self.vae.as_ref().expect("VAE Not loaded!");
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("call load_shell first"))?;
+
+        // (1, h*w, 64) -> (1, h, w, 64) -> (1, 64, h, w), then z * std + mean
+        let z = Tensor::<1>::from_floats(latents, device)
+            .reshape([1, h, w, 64])
+            .permute([0, 3, 1, 2]);
+        let z = LatentNorm::new(&vae.mean, &vae.std, device).denormalize(z);
+
+        let out = self.vae.as_ref().expect("VAE not loaded!").decode(z);
+
+        let [_, _, oh, ow] = out.dims();
+        let data = out
+            .into_data_async()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?
+            .try_into_vec::<f32>()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let mut rgba = vec![0u8; oh * ow * 4];
+        for y in 0..oh {
+            for x in 0..ow {
+                for c in 0..4 {
+                    let v = data[c * oh * ow + y * ow + x];
+                    rgba[(y * ow + x) * 4 + c] =
+                        ((v + 1.0) * 127.5).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        Ok(DecodedImage {
+            width: ow as u32,
+            height: oh as u32,
+            rgba,
+        })
     }
 }

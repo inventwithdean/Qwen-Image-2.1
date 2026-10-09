@@ -4718,6 +4718,7 @@ dependencies = [
  "burn-store",
  "console_error_panic_hook",
  "getrandom 0.4.3",
+ "image",
  "js-sys",
  "safetensors 0.8.0",
  "serde",
