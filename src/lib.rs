@@ -264,7 +264,6 @@ impl QwenWeb {
                 KvCacheMode::CACHED
             };
             let timestep = Tensor::<1>::from_floats([sigmas[step]], device);
-            // was: Tensor<1, Int>::from_ints(...).reshape(...).bool().repeat_dim(...)
             let img_mask: Vec<bool> = (0..t_text + slots).map(|i| i >= t_text).collect();
 
             let out = model.forward(
