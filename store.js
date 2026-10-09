@@ -1,17 +1,10 @@
-// store.js 
-// everything about where model files come from.
-
-// Today: static assets under ./out, cached into OPFS on first use.
-// Later (HF): only urlFor() changes, e.g.
-// const urlFor = (name) => `https://huggingface.co/inventwithdean/Qwen-Image-2.1/resolve/main/${name}`;
-
 const CACHE_DIR = 'qwen-cache';
 const CACHE_VERSION = 'v1';
 
 export const NUM_LAYERS = 32; // transformer blocks
 
 // OPFS name -> source URL.
-const urlFor = (name) => `./out/${name}`;
+const urlFor = (name) => `https://huggingface.co/inventwithdean/Qwen-Image-2.1/resolve/main/${name}`;
 
 let dirPromise = null;
 

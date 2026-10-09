@@ -1,10 +1,3 @@
-// rpc.js 
-// minimal promise-based RPC over postMessage, shared by page and worker.
-
-// Workers live in a separate realm: the only channel to the page is postMessage,
-// and only structured-cloneable data can cross. This turns that raw channel into
-// two halves so the rest of the code is just `await api.generate({...})` vs.
-// plain exported functions.
 
 // ---- page side -------------------------------------------------------------
 export function createClient(worker) {

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -22,33 +23,124 @@
         }
     </script>
     <style>
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
-        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #4b5563; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
 
-        input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; background: transparent; cursor: pointer; }
-        input[type="range"]::-webkit-slider-runnable-track { height: 12px; background: #fff; border: 2px solid #000; border-radius: 999px; box-shadow: 2px 2px 0px 0px rgba(0,0,0,1); }
-        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; height: 24px; width: 24px; border-radius: 50%; background: var(--primary, #ffce23); border: 3px solid #000; margin-top: -8px; box-shadow: 2px 2px 0px 0px rgba(0,0,0,1); transition: transform 0.1s; }
-        input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.1); }
-        
-        select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='black' stroke-width='3'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E"); background-position: right 1rem center; background-repeat: no-repeat; background-size: 1.2em 1.2em; }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
 
-        #stage::before { content: 'no image yet — hit Generate'; position: absolute; inset: 0; display: grid; place-items: center; color: #9ca3af; font-weight: 800; font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; background: radial-gradient(circle, #d1d5db 2px, transparent 2px); background-size: 24px 24px; z-index: 0; border-radius: 20px; }
-        #preview { position: relative; z-index: 10; image-rendering: pixelated; }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 999px;
+        }
 
-        body.busy #status::before { content: ''; display: inline-block; width: 16px; height: 16px; border: 3px solid #ffce23; border-top-color: black; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
-        @keyframes spin { to { transform: rotate(360deg); } }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #4b5563;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #6b7280;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            background: transparent;
+            cursor: pointer;
+        }
+
+        input[type="range"]::-webkit-slider-runnable-track {
+            height: 12px;
+            background: #fff;
+            border: 2px solid #000;
+            border-radius: 999px;
+            box-shadow: 2px 2px 0px 0px rgba(0, 0, 0, 1);
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 24px;
+            width: 24px;
+            border-radius: 50%;
+            background: var(--primary, #ffce23);
+            border: 3px solid #000;
+            margin-top: -8px;
+            box-shadow: 2px 2px 0px 0px rgba(0, 0, 0, 1);
+            transition: transform 0.1s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.1);
+        }
+
+        select {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='black' stroke-width='3'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
+            background-position: right 1rem center;
+            background-repeat: no-repeat;
+            background-size: 1.2em 1.2em;
+        }
+
+        #stage::before {
+            content: 'no image yet — hit Generate';
+            position: absolute;
+            inset: 0;
+            display: grid;
+            place-items: center;
+            color: #9ca3af;
+            font-weight: 800;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            background: radial-gradient(circle, #d1d5db 2px, transparent 2px);
+            background-size: 24px 24px;
+            z-index: 0;
+            border-radius: 20px;
+        }
+
+        #preview {
+            position: relative;
+            z-index: 10;
+            image-rendering: pixelated;
+        }
+
+        body.busy #status::before {
+            content: '';
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 3px solid #ffce23;
+            border-top-color: black;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
     </style>
 </head>
-<body class="bg-base text-black min-h-screen flex flex-col items-center py-8 px-4 md:px-8 selection:bg-primary selection:text-black">
+
+<body
+    class="bg-base text-black min-h-screen flex flex-col items-center py-8 px-4 md:px-8 selection:bg-primary selection:text-black">
 
     <header class="text-center mb-8">
-        <div class="inline-flex items-center justify-center gap-3 mb-3 bg-white border-4 border-black rounded-full px-5 py-2 shadow-brutal-sm">
+        <div
+            class="inline-flex items-center justify-center gap-3 mb-3 bg-white border-4 border-black rounded-full px-5 py-2 shadow-brutal-sm">
             <h1 class="text-2xl md:text-3xl font-black tracking-tight">Qwen Image 2.1</h1>
-            <span class="bg-primary border-2 border-black text-black text-xs font-black uppercase tracking-widest px-3 py-1 rounded-full">WebGPU</span>
+            <span
+                class="bg-primary border-2 border-black text-black text-xs font-black uppercase tracking-widest px-3 py-1 rounded-full">WebGPU</span>
         </div>
         <p class="text-base font-bold text-gray-700">Inference engine written in Rust 🦀</p>
         <p class="text-sm font-bold text-gray-500 mt-1">Burn 🔥 + CubeCL + wgpu</p>
@@ -58,8 +150,9 @@
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="flex flex-col gap-2">
                 <label class="font-black text-sm uppercase tracking-wider flex items-center justify-between text-black">
-                    Steps 
-                    <output id="steps-out" class="text-muted bg-gray-100 border-2 border-black rounded-full px-3 py-0.5 text-xs text-black"></output>
+                    Steps
+                    <output id="steps-out"
+                        class="text-muted bg-gray-100 border-2 border-black rounded-full px-3 py-0.5 text-xs text-black"></output>
                 </label>
                 <div class="pt-2">
                     <input type="range" id="steps" min="2" max="50" step="1" value="25">
@@ -70,7 +163,8 @@
                 <label class="font-black text-sm uppercase tracking-wider flex items-center justify-between text-black">
                     Image Size
                 </label>
-                <select id="size-selector" class="appearance-none w-full bg-white text-black border-4 border-black rounded-2xl px-4 py-2.5 font-bold text-base shadow-brutal-sm focus:outline-none focus:ring-4 focus:ring-primary/50 cursor-pointer transition-transform hover:-translate-y-0.5">
+                <select id="size-selector"
+                    class="appearance-none w-full bg-white text-black border-4 border-black rounded-2xl px-4 py-2.5 font-bold text-base shadow-brutal-sm focus:outline-none focus:ring-4 focus:ring-primary/50 cursor-pointer transition-transform hover:-translate-y-0.5">
                     <optgroup label="Square" class="bg-white text-black">
                         <option value="256x256" class="bg-white text-black">256 × 256</option>
                         <option value="512x512" selected class="bg-white text-black">512 × 512</option>
@@ -92,27 +186,39 @@
         </div>
 
         <div class="flex flex-wrap justify-center gap-4 mb-6">
-            <button id="run" class="bg-primary text-black border-4 border-black rounded-full px-8 py-3 font-black text-lg uppercase tracking-widest shadow-brutal transition-all hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-brutal-hover active:translate-x-[4px] active:translate-y-[4px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:translate-x-0 disabled:hover:translate-y-0 disabled:hover:shadow-brutal disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal">
+            <button id="run"
+                class="bg-primary text-black border-4 border-black rounded-full px-8 py-3 font-black text-lg uppercase tracking-widest shadow-brutal transition-all hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-brutal-hover active:translate-x-[4px] active:translate-y-[4px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:translate-x-0 disabled:hover:translate-y-0 disabled:hover:shadow-brutal disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal">
                 Generate
             </button>
-            <button id="save" disabled class="bg-white text-black border-4 border-black rounded-full px-8 py-3 font-black text-lg uppercase tracking-widest shadow-brutal transition-all hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-brutal-hover active:translate-x-[4px] active:translate-y-[4px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:hover:translate-x-0 disabled:hover:translate-y-0 disabled:hover:shadow-brutal disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal">
+            <button id="save" disabled
+                class="bg-white text-black border-4 border-black rounded-full px-8 py-3 font-black text-lg uppercase tracking-widest shadow-brutal transition-all hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-brutal-hover active:translate-x-[4px] active:translate-y-[4px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:hover:translate-x-0 disabled:hover:translate-y-0 disabled:hover:shadow-brutal disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal">
                 Save PNG
             </button>
         </div>
 
         <div id="status" class="text-center font-bold text-gray-600 mb-4 min-h-[24px] empty:hidden"></div>
 
-        <div id="stage" class="relative w-full flex justify-center items-center bg-gray-50 border-4 border-black rounded-3xl p-2 shadow-brutal mb-8 h-[40vh] md:h-[50vh] overflow-hidden">
-            <canvas id="preview" width="512" height="512" class="max-w-full max-h-full w-auto h-auto object-contain border-4 border-black rounded-2xl shadow-brutal-sm bg-white"></canvas>
+        <div id="stage"
+            class="relative w-full flex justify-center items-center bg-gray-50 border-4 border-black rounded-3xl p-2 shadow-brutal mb-8 h-[40vh] md:h-[50vh] overflow-hidden">
+            <canvas id="preview" width="512" height="512"
+                class="max-w-full max-h-full w-auto h-auto object-contain border-4 border-black rounded-2xl shadow-brutal-sm bg-white"></canvas>
         </div>
 
         <div class="relative">
-            <div class="absolute -top-3 left-6 bg-black text-white text-xs font-black uppercase tracking-widest px-3 py-1 rounded-full border-2 border-black z-10">
+            <div
+                class="absolute -top-3 left-6 bg-black text-white text-xs font-black uppercase tracking-widest px-3 py-1 rounded-full border-2 border-black z-10">
                 Worker Logs
             </div>
-            <pre id="logs" class="w-full bg-[#111827] text-[#a8b3c4] border-4 border-black rounded-2xl p-4 pt-6 text-xs font-mono h-32 overflow-y-auto shadow-brutal custom-scrollbar empty:before:content-['Awaiting_engine_initialization...'] empty:before:text-gray-600"></pre>
+            <pre id="logs"
+                class="w-full bg-[#111827] text-[#a8b3c4] border-4 border-black rounded-2xl p-4 pt-6 text-xs font-mono h-32 overflow-y-auto shadow-brutal custom-scrollbar empty:before:content-['Awaiting_engine_initialization...'] empty:before:text-gray-600"></pre>
+
+        </div>
+        <div class="text-center mt-4">
+            <p class="text-sm font-bold text-gray-500 mt-1">Fixed prompt for now. Text Encoder is being implemented!</p>
         </div>
     </main>
+
     <script type="module" src="ui.js"></script>
 </body>
+
 </html>

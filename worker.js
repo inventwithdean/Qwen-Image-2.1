@@ -1,5 +1,3 @@
-// worker.js
-// owns the WASM model
 // talks to the page only through rpc.js.
 import init, { QwenWeb } from './pkg/qwen_image.js';
 import { createServer, notify } from './rpc.js';
