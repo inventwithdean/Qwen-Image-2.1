@@ -82,9 +82,6 @@ impl LatentNorm {
     }
 }
 
-const LATENT_H: usize = 32;
-const LATENT_W: usize = 32;
-
 #[wasm_bindgen]
 pub struct DecodedImage {
     width: u32,
