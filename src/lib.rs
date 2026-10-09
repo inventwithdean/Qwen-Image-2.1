@@ -71,12 +71,12 @@ impl LatentNorm {
         }
     }
 
-    /// diffusion-space latents -> VAE-space (use before decode)
+    /// diffusion space latents -> VAE-space (before decode)
     pub fn denormalize(&self, z: Tensor<4>) -> Tensor<4> {
         z * self.std.clone() + self.mean.clone()
     }
 
-    /// VAE-space latents -> diffusion-space (use after encode)
+    /// VAE space latents -> diffusion-space (after encode)
     pub fn normalize(&self, z: Tensor<4>) -> Tensor<4> {
         (z - self.mean.clone()) / self.std.clone()
     }
@@ -99,7 +99,7 @@ impl DecodedImage {
     pub fn height(&self) -> u32 {
         self.height
     }
-    /// Uint8ClampedArray, ready for `new ImageData(...)`
+    /// Uint8ClampedArray, ready for `new ImageData(...)` on JS side
     #[wasm_bindgen(getter)]
     pub fn rgba(&self) -> js_sys::Uint8ClampedArray {
         js_sys::Uint8ClampedArray::from(self.rgba.as_slice())
@@ -190,7 +190,7 @@ impl QwenWeb {
         Ok(())
     }
 
-    /// Release the OPFS sync handles (call before dropping the worker / clearing cache).
+    /// Release the OPFS sync handles
     pub fn close_blocks(&mut self) {
         if let Some(s) = self.streamer.as_mut() {
             s.close_all();
