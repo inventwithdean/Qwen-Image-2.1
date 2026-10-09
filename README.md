@@ -33,4 +33,4 @@ Flash attention (used in DiT) doesn't require materializing full N x N matrix he
 
 Code distributed under MIT license. 
 <br>
-Weights are under [qwen-research license](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE) and not distributed with the repo.
+Weights are under [qwen-research license](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE).
