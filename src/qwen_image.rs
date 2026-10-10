@@ -1,236 +1,21 @@
-use std::{path::PathBuf, thread, time::Instant};
-
 use burn::{
     Tensor,
     config::Config,
     module::Module,
     nn::{Linear, LinearConfig},
-    store::ModuleRecord,
-    tensor::{Bool, Bytes, Device, IndexingUpdateOp, Int, activation::silu, s},
+    tensor::{Bool, Device, IndexingUpdateOp, Int, activation::silu, s},
 };
 
-use crate::qwen_image_modules::{
-    KvCacheMode, QwenImageAdaLayerNormContinuous, QwenImageAdaLayerNormContinuousConfig,
-    QwenImageKVCache, QwenImageRope, QwenImageRopeConfig, QwenImageTextProjection,
-    QwenImageTextProjectionConfig, QwenImageTimestepProjEmbeddings,
-    QwenImageTimestepProjEmbeddingsConfig, QwenImageTransformerBlock,
-    QwenImageTransformerBlockConfig, qwenimage_prefix_segments,
+use crate::{
+    qwen_image_modules::{
+        KvCacheMode, QwenImageAdaLayerNormContinuous, QwenImageAdaLayerNormContinuousConfig,
+        QwenImageKVCache, QwenImageRope, QwenImageRopeConfig, QwenImageTextProjection,
+        QwenImageTextProjectionConfig, QwenImageTimestepProjEmbeddings,
+        QwenImageTimestepProjEmbeddingsConfig, QwenImageTransformerBlock,
+        QwenImageTransformerBlockConfig, qwenimage_prefix_segments,
+    },
+    streamer::QwenImageBlockStreamerWeb,
 };
-
-use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
-
-/// Anything that can hand the model one transformer block at a time.
-pub trait BlockProvider {
-    fn num_layers(&self) -> usize;
-    fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock;
-}
-
-impl BlockProvider for QwenImageBlockStreamer {
-    fn num_layers(&self) -> usize {
-        self.num_layers
-    }
-    fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
-        QwenImageBlockStreamer::get(self, layer) // inherent method
-    }
-}
-
-#[wasm_bindgen]
-extern "C" {
-    /// FileSystemSyncAccessHandle (OPFS, dedicated workers only)
-    pub type SyncHandle;
-
-    #[wasm_bindgen(method, js_name = getSize)]
-    fn get_size(this: &SyncHandle) -> f64;
-
-    // JS writes straight into wasm memory through a view over `buf`.
-    #[wasm_bindgen(method, js_name = read)]
-    fn read_at(this: &SyncHandle, buf: &mut [u8], opts: &JsValue) -> f64;
-
-    #[wasm_bindgen(method, js_name = close)]
-    fn close(this: &SyncHandle);
-}
-
-fn read_opts(at: usize) -> JsValue {
-    let o = js_sys::Object::new();
-    js_sys::Reflect::set(&o, &"at".into(), &JsValue::from_f64(at as f64)).unwrap();
-    o.into()
-}
-
-pub struct QwenImageBlockStreamerWeb {
-    pub num_layers: usize,
-    handles: Vec<SyncHandle>, // one OPFS file per block, index == layer
-    active_block: Option<QwenImageTransformerBlock>, // the single reusable GPU block
-}
-
-impl QwenImageBlockStreamerWeb {
-    pub fn new_empty(config: &QwenImageTransformerModelConfig, device: &Device) -> Self {
-        let inner_dim = config.num_attention_heads * config.attention_head_dim;
-        let block_config = QwenImageTransformerBlockConfig::new(
-            inner_dim,
-            config.num_attention_heads,
-            config.attention_head_dim,
-            config.mlp_ratio,
-            config.eps,
-        );
-
-        Self {
-            num_layers: config.num_layers,
-            handles: Vec::with_capacity(config.num_layers),
-            active_block: Some(block_config.init(device)),
-        }
-    }
-
-    /// Register the OPFS file for the next layer (must be called in layer order).
-    pub fn add_handle(&mut self, handle: SyncHandle) -> Result<usize, String> {
-        if self.handles.len() >= self.num_layers {
-            return Err(format!("already have {} handles", self.num_layers));
-        }
-        self.handles.push(handle);
-        Ok(self.handles.len() - 1)
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.handles.len() == self.num_layers
-    }
-
-    pub fn block_size(&self, layer: usize) -> usize {
-        self.handles[layer].get_size() as usize
-    }
-
-    /// Synchronously read one block file from disk into wasm memory.
-    fn read_record(&self, layer: usize) -> ModuleRecord {
-        let h = &self.handles[layer];
-        let size = h.get_size() as usize;
-        let mut buf = vec![0u8; size];
-
-        let mut off = 0;
-        while off < size {
-            let n = h.read_at(&mut buf[off..], &read_opts(off)) as usize;
-            assert!(
-                n > 0,
-                "OPFS read returned 0 bytes (block {layer}, offset {off}/{size})"
-            );
-            off += n;
-        }
-
-        ModuleRecord::from_bytes(Bytes::from_bytes_vec(buf))
-            .unwrap_or_else(|e| panic!("block {layer}: bad record: {e:?}"))
-    }
-
-    pub fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
-        assert!(
-            self.is_ready(),
-            "only {}/{} block handles registered",
-            self.handles.len(),
-            self.num_layers
-        );
-
-        // disk -> wasm (one block, freed when load_record consumes it) -> GPU
-        let record = self.read_record(layer);
-
-        let block = self
-            .active_block
-            .take()
-            .expect("Active block not initialized");
-        self.active_block = Some(block.load_record(record));
-        self.active_block.as_ref().unwrap()
-    }
-
-    pub fn close_all(&mut self) {
-        for h in self.handles.drain(..) {
-            h.close();
-        }
-    }
-}
-
-impl BlockProvider for QwenImageBlockStreamerWeb {
-    fn num_layers(&self) -> usize {
-        self.num_layers
-    }
-    fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
-        QwenImageBlockStreamerWeb::get(self, layer)
-    }
-}
-
-pub struct QwenImageBlockStreamer {
-    pub num_layers: usize,
-    records: Vec<ModuleRecord>,
-    active_block: Option<QwenImageTransformerBlock>,
-}
-
-impl QwenImageBlockStreamer {
-    pub fn new(
-        src: impl Into<PathBuf>,
-        config: &QwenImageTransformerModelConfig,
-        device: &Device,
-    ) -> Self {
-        let src_path = src.into();
-        let inner_dim = config.num_attention_heads * config.attention_head_dim;
-        let block_config = QwenImageTransformerBlockConfig::new(
-            inner_dim,
-            config.num_attention_heads,
-            config.attention_head_dim,
-            config.mlp_ratio,
-            config.eps,
-        );
-
-        println!("Loading {} layers into RAM...", config.num_layers);
-
-        let start = Instant::now();
-        let mut records_opt: Vec<Option<ModuleRecord>> =
-            (0..config.num_layers).map(|_| None).collect();
-        let mid = config.num_layers / 2; // 16
-        thread::scope(|s| {
-            let (first_half, second_half) = records_opt.split_at_mut(mid);
-            let path_ref = &src_path;
-
-            s.spawn(move || {
-                for (idx, slot) in first_half.iter_mut().enumerate() {
-                    let layer = idx;
-                    let bpk_path = path_ref.join(format!("block_{layer}.bpk"));
-                    let record = ModuleRecord::load(&bpk_path).unwrap();
-                    *slot = Some(ModuleRecord::from_bytes(record.into_bytes().unwrap()).unwrap());
-                }
-            });
-            s.spawn(move || {
-                for (idx, slot) in second_half.iter_mut().enumerate() {
-                    let layer = mid + idx;
-                    let bpk_path = path_ref.join(format!("block_{layer}.bpk"));
-                    let record = ModuleRecord::load(&bpk_path).unwrap();
-                    *slot = Some(ModuleRecord::from_bytes(record.into_bytes().unwrap()).unwrap());
-                }
-            });
-        });
-
-        let records: Vec<ModuleRecord> = records_opt.into_iter().map(Option::unwrap).collect();
-        println!("Loaded in {:.2?}", start.elapsed());
-
-        let active_block = block_config.init(device);
-
-        Self {
-            num_layers: config.num_layers,
-            records,
-            active_block: Some(active_block),
-        }
-    }
-
-    pub fn get(&mut self, layer: usize) -> &QwenImageTransformerBlock {
-        let record = self.records[layer].clone();
-
-        let block = self
-            .active_block
-            .take()
-            .expect("Active block not initialized");
-
-        let updated_block = block.load_record(record);
-        self.active_block = Some(updated_block);
-        self.active_block.as_ref().unwrap()
-    }
-
-    pub fn load_layer(&mut self, layer: usize) -> &QwenImageTransformerBlock {
-        self.get(layer)
-    }
-}
 
 #[derive(Module, Debug)]
 pub struct DummyModule {}
@@ -288,7 +73,7 @@ impl QwenImageTransformerModel {
 
     pub fn forward(
         &self,
-        streamer: &mut impl BlockProvider,
+        streamer: &mut QwenImageBlockStreamerWeb,
         hidden_states: Tensor<3>,
         encoder_hidden_states: Tensor<3>,
         timestep: Tensor<1>,
@@ -431,7 +216,7 @@ impl QwenImageTransformerModel {
             segments = Some(qwenimage_prefix_segments(&image_ids, prefix_len));
         }
 
-        for i in 0..streamer.num_layers() {
+        for i in 0..streamer.num_layers {
             let layer_cache = kv_cache.as_deref_mut().map(|cache| cache.get_layer_mut(i));
 
             joint_hidden_states = streamer.get(i).forward(
@@ -460,26 +245,26 @@ impl QwenImageTransformerModel {
 #[derive(Config, Debug)]
 pub struct QwenImageTransformerModelConfig {
     #[config(default = 1)]
-    patch_size: usize,
+    pub patch_size: usize,
     #[config(default = 64)]
-    in_channels: usize,
+    pub in_channels: usize,
     #[config(default = 64)]
-    out_channels: usize,
+    pub out_channels: usize,
     #[config(default = 32)]
-    num_layers: usize,
+    pub num_layers: usize,
     #[config(default = 128)]
-    attention_head_dim: usize,
+    pub attention_head_dim: usize,
     #[config(default = 32)]
-    num_attention_heads: usize,
+    pub num_attention_heads: usize,
     #[config(default = 4096)]
-    context_in_dim: usize,
+    pub context_in_dim: usize,
     #[config(default = 3)]
-    mlp_ratio: usize,
-    axes_dim_rope: [usize; 3],
+    pub mlp_ratio: usize,
+    pub axes_dim_rope: [usize; 3],
     #[config(default = 1e-6)]
-    eps: f64,
+    pub eps: f64,
     #[config(default = true)]
-    causal_condition: bool,
+    pub causal_condition: bool,
 }
 
 impl QwenImageTransformerModelConfig {

@@ -12,7 +12,7 @@
             theme: {
                 extend: {
                     fontFamily: { sans: ['Nunito', 'system-ui', 'sans-serif'] },
-                    colors: { 'base': '#f3f2eb', 'card': '#ffffff', 'primary': '#ffce23', 'muted': '#6b7280' },
+                    colors: { 'paper': '#f3f2eb', 'card': '#ffffff', 'primary': '#ffce23', 'muted': '#6b7280' },
                     boxShadow: {
                         'brutal': '8px 8px 0px 0px rgba(0,0,0,1)',
                         'brutal-sm': '4px 4px 0px 0px rgba(0,0,0,1)',
@@ -133,7 +133,7 @@
 </head>
 
 <body
-    class="bg-base text-black min-h-screen flex flex-col items-center py-8 px-4 md:px-8 selection:bg-primary selection:text-black">
+    class="bg-paper text-black min-h-screen flex flex-col items-center py-8 px-4 md:px-8 selection:bg-primary selection:text-black">
 
     <header class="text-center mb-8">
         <div
@@ -143,10 +143,17 @@
                 class="bg-primary border-2 border-black text-black text-xs font-black uppercase tracking-widest px-3 py-1 rounded-full">WebGPU</span>
         </div>
         <p class="text-base font-bold text-gray-700">Inference engine written in Rust 🦀</p>
-        <p class="text-sm font-bold text-gray-500 mt-1">Burn 🔥 + CubeCL + wgpu</p>
     </header>
 
     <main class="w-full max-w-4xl bg-card border-4 border-black rounded-3xl p-6 md:p-8 shadow-brutal">
+        <div class="flex flex-col gap-2 mb-8">
+            <label class="font-black text-sm uppercase tracking-wider flex items-center justify-between text-black">
+                Prompt
+            </label>
+            <textarea id="prompt" rows="7" spellcheck="false"
+                class="w-full bg-white text-black border-4 border-black rounded-2xl px-4 py-2.5 font-bold text-base shadow-brutal-sm focus:outline-none focus:ring-4 focus:ring-primary/50 resize-y">Close-up editorial portrait of a 28-year-old Scandinavian woman with natural freckles, wind-blown auburn hair, and warm green eyes. She is smiling subtly and holding a rustic wooden sign with both hands. Written clearly on the sign in bold, clean, hand-painted white lettering is the exact text "I ❤️ WebGPU". She is wearing a charcoal wool turtleneck. Shot on an 85mm lens, f/2.2, shallow depth of field with the background softly blurred. Soft overcast morning light from the side, hyper-detailed skin texture, fine pores, fabric weave visible, realistic film grain, photorealistic, 8k resolution, crisp typography, perfect text spelling.</textarea>
+        </div>
+
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="flex flex-col gap-2">
                 <label class="font-black text-sm uppercase tracking-wider flex items-center justify-between text-black">
@@ -155,7 +162,7 @@
                         class="text-muted bg-gray-100 border-2 border-black rounded-full px-3 py-0.5 text-xs text-black"></output>
                 </label>
                 <div class="pt-2">
-                    <input type="range" id="steps" min="2" max="50" step="1" value="25">
+                    <input type="range" id="steps" min="2" max="40" step="1" value="20">
                 </div>
             </div>
 
@@ -213,8 +220,23 @@
                 class="w-full bg-[#111827] text-[#a8b3c4] border-4 border-black rounded-2xl p-4 pt-6 text-xs font-mono h-32 overflow-y-auto shadow-brutal custom-scrollbar empty:before:content-['Awaiting_engine_initialization...'] empty:before:text-gray-600"></pre>
 
         </div>
-        <div class="text-center mt-4">
-            <p class="text-sm font-bold text-gray-500 mt-1">Fixed prompt for now. Text Encoder is being implemented!</p>
+        <div class="text-center mt-4 flex flex-col items-center gap-2">
+
+            <p class="text-sm font-bold text-gray-500">
+                Built with
+                <a href="https://github.com/tracel-ai/burn" target="_blank" rel="noopener"
+                    class="underline decoration-2 hover:text-black">Burn 🔥</a>
+                +
+                <a href="https://github.com/tracel-ai/cubecl" target="_blank" rel="noopener"
+                    class="underline decoration-2 hover:text-black">CubeCL</a>
+                +
+                <a href="https://wgpu.rs" target="_blank" rel="noopener"
+                    class="underline decoration-2 hover:text-black">wgpu</a>
+            </p>
+            <a href="https://github.com/inventwithdean/Qwen-Image-2.1" target="_blank" rel="noopener"
+                class="inline-block bg-white text-black border-4 border-black rounded-full px-5 py-1.5 font-black text-sm uppercase tracking-widest shadow-brutal-sm transition-all hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-brutal-hover active:translate-x-[4px] active:translate-y-[4px] active:shadow-none">
+                ⭐ Source on GitHub
+            </a>
         </div>
     </main>
 

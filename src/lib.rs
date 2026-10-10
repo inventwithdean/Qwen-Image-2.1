@@ -1,21 +1,26 @@
 pub mod normalization;
 pub mod qwen_image;
 pub mod qwen_image_modules;
+pub mod streamer;
+pub mod text_encoder;
 pub mod vae;
 
 use burn::{
     module::Module,
+    nn::attention::generate_autoregressive_mask,
     store::ModuleRecord,
-    tensor::{Bytes, Device, Distribution, FloatDType, Tensor, TensorData, s},
+    tensor::{Bytes, Device, Distribution, FloatDType, Int, Tensor, TensorData, s},
 };
-use qwen_image::{
-    QwenImageBlockStreamerWeb, QwenImageTransformerModel, QwenImageTransformerModelConfig,
-    SyncHandle,
-};
+use qwen_image::{QwenImageTransformerModel, QwenImageTransformerModelConfig};
 use qwen_image_modules::{KvCacheMode, QwenImageKVCache};
+use tokenizers::Tokenizer;
 use wasm_bindgen::prelude::*;
 
-use crate::vae::model::{AutoencoderKLQwenImage, AutoencoderKLQwenImageConfig};
+use crate::{
+    streamer::{QwenImageBlockStreamerWeb, QwenImageTextEncoderStreamerWeb},
+    text_encoder::model::{Qwen3VLTextModel, Qwen3VLTextModelConfig},
+    vae::model::{AutoencoderKLQwenImage, AutoencoderKLQwenImageConfig},
+};
 
 #[wasm_bindgen]
 extern "C" {
@@ -49,37 +54,13 @@ fn schedule(steps: usize, seq_len: usize) -> Vec<f32> {
 
 #[wasm_bindgen]
 pub struct QwenWeb {
-    model: Option<QwenImageTransformerModel>,
-    streamer: Option<QwenImageBlockStreamerWeb>,
+    tokenizer: Option<Tokenizer>,
+    text_encoder: Option<Qwen3VLTextModel>,
+    text_encoder_streamer: Option<QwenImageTextEncoderStreamerWeb>,
+    dit: Option<QwenImageTransformerModel>,
+    dit_streamer: Option<QwenImageBlockStreamerWeb>,
     vae: Option<AutoencoderKLQwenImage>,
     device: Option<Device>,
-}
-
-pub struct LatentNorm {
-    mean: Tensor<4>, // (1, 64, 1, 1)
-    std: Tensor<4>,
-}
-
-impl LatentNorm {
-    pub fn new(mean: &[f32], std: &[f32], device: &Device) -> Self {
-        let make = |v: &[f32]| {
-            Tensor::<4>::from_data(TensorData::new(v.to_vec(), [1, v.len(), 1, 1]), device)
-        };
-        Self {
-            mean: make(mean),
-            std: make(std),
-        }
-    }
-
-    /// diffusion space latents -> VAE-space (before decode)
-    pub fn denormalize(&self, z: Tensor<4>) -> Tensor<4> {
-        z * self.std.clone() + self.mean.clone()
-    }
-
-    /// VAE space latents -> diffusion-space (after encode)
-    pub fn normalize(&self, z: Tensor<4>) -> Tensor<4> {
-        (z - self.mean.clone()) / self.std.clone()
-    }
 }
 
 #[wasm_bindgen]
@@ -99,7 +80,6 @@ impl DecodedImage {
     pub fn height(&self) -> u32 {
         self.height
     }
-    /// Uint8ClampedArray, ready for `new ImageData(...)` on JS side
     #[wasm_bindgen(getter)]
     pub fn rgba(&self) -> js_sys::Uint8ClampedArray {
         js_sys::Uint8ClampedArray::from(self.rgba.as_slice())
@@ -114,26 +94,14 @@ impl QwenWeb {
     pub fn new() -> QwenWeb {
         console_error_panic_hook::set_once();
         QwenWeb {
-            model: None,
-            streamer: None,
+            tokenizer: None,
+            text_encoder: None,
+            text_encoder_streamer: None,
+            dit: None,
+            dit_streamer: None,
             vae: None,
             device: None,
         }
-    }
-
-    fn load_vae(&mut self, vae_bytes: Vec<u8>) -> Result<(), JsValue> {
-        let device = self
-            .device
-            .as_ref()
-            .ok_or_else(|| JsValue::from_str("Call load_shell first!"))?;
-        let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(vae_bytes))
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        self.vae = Some(
-            AutoencoderKLQwenImageConfig::new()
-                .init(device)
-                .load_record(record),
-        );
-        Ok(())
     }
 
     pub async fn init_device(&mut self) -> Result<(), JsValue> {
@@ -147,36 +115,47 @@ impl QwenWeb {
         Ok(())
     }
 
-    /// Init WebGPU, build the layer-less model shell, and prepare the streamer.
-    pub async fn load_shell(&mut self, shell_bytes: &[u8]) -> Result<(), JsValue> {
-        log("Loading DiT shell...");
-        let device = self.device.as_ref().expect("Call init_device first!");
-        let config = QwenImageTransformerModelConfig::new([16, 56, 56]);
-        let mut model = config.clone().with_num_layers(0).init(&device);
-
-        let shell_record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(shell_bytes.to_vec()))
+    pub fn load_tokenizer(&mut self, tokenizer_bytes: &[u8]) -> Result<(), JsValue> {
+        log("Loading tokenizer...");
+        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        model = model.load_record(shell_record);
-
-        log("Preparing Transformer Block Streamer...");
-        let streamer = QwenImageBlockStreamerWeb::new_empty(&config, &device);
-
-        self.model = Some(model);
-        self.streamer = Some(streamer);
+        self.tokenizer = Some(tokenizer);
+        log("Tokenizer loaded successfully!");
         Ok(())
     }
 
-    pub fn num_layers(&self) -> Result<usize, JsValue> {
-        self.streamer
+    pub fn load_text_encoder_shell(
+        &mut self,
+        text_encoder_shell_bytes: Vec<u8>,
+    ) -> Result<(), JsValue> {
+        log("Loading Text Encoder Shell...");
+        let device = self
+            .device
             .as_ref()
-            .map(|s| s.num_layers)
-            .ok_or_else(|| JsValue::from_str("call load_shell first"))
+            .ok_or_else(|| JsValue::from_str("Device not initialized!"))?;
+        let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(text_encoder_shell_bytes))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        log("Preparing Text Encoder Block Streamer...");
+        let streamer = streamer::QwenImageTextEncoderStreamerWeb::new_empty(device);
+
+        self.text_encoder_streamer = Some(streamer);
+
+        self.text_encoder = Some(
+            Qwen3VLTextModelConfig::new()
+                .with_num_hidden_layers(0)
+                .init(device)
+                .load_record(record),
+        );
+        Ok(())
     }
 
-    /// Register the OPFS FileSystemSyncAccessHandle for the next layer, in order.
-    pub fn add_block_handle(&mut self, handle: SyncHandle) -> Result<(), JsValue> {
+    pub fn add_text_encoder_block_handle(
+        &mut self,
+        handle: streamer::SyncHandle,
+    ) -> Result<(), JsValue> {
         let streamer = self
-            .streamer
+            .text_encoder_streamer
             .as_mut()
             .ok_or_else(|| JsValue::from_str("call load_shell first"))?;
         let idx = streamer
@@ -190,11 +169,77 @@ impl QwenWeb {
         Ok(())
     }
 
-    /// Release the OPFS sync handles
-    pub fn close_blocks(&mut self) {
-        if let Some(s) = self.streamer.as_mut() {
+    pub async fn load_dit_shell(&mut self, shell_bytes: Vec<u8>) -> Result<(), JsValue> {
+        log("Loading DiT shell...");
+        let device = self.device.as_ref().expect("Call init_device first!");
+        let config = QwenImageTransformerModelConfig::new([16, 56, 56]);
+        let mut model = config.clone().with_num_layers(0).init(&device);
+
+        let shell_record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(shell_bytes))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        model = model.load_record(shell_record);
+
+        log("Preparing Transformer Block Streamer...");
+        let streamer = streamer::QwenImageBlockStreamerWeb::new_empty(&config, device);
+
+        self.dit = Some(model);
+        self.dit_streamer = Some(streamer);
+        Ok(())
+    }
+
+    pub fn num_dit_layers(&self) -> Result<usize, JsValue> {
+        self.dit_streamer
+            .as_ref()
+            .map(|s| s.num_layers)
+            .ok_or_else(|| JsValue::from_str("call load_shell first"))
+    }
+
+    pub fn add_dit_block_handle(&mut self, handle: streamer::SyncHandle) -> Result<(), JsValue> {
+        let streamer = self
+            .dit_streamer
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("call load_shell first"))?;
+        let idx = streamer
+            .add_handle(handle)
+            .map_err(|e| JsValue::from_str(&e))?;
+        log(&format!(
+            "   - Registered block {} ({:.1} MiB on disk)",
+            idx,
+            streamer.block_size(idx) as f64 / (1024.0 * 1024.0)
+        ));
+        Ok(())
+    }
+
+    fn load_vae(&mut self, vae_bytes: Vec<u8>) -> Result<(), JsValue> {
+        log("Loading VAE...");
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Device not initialized!"))?;
+        let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(vae_bytes))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.vae = Some(
+            AutoencoderKLQwenImageConfig::new()
+                .init(device)
+                .load_record(record),
+        );
+        Ok(())
+    }
+
+    pub fn release_text_encoder(&mut self) {
+        if let Some(s) = self.text_encoder_streamer.as_mut() {
             s.close_all();
         }
+        self.text_encoder = None;
+        self.text_encoder_streamer = None;
+    }
+
+    pub fn release_dit(&mut self) {
+        if let Some(s) = self.dit_streamer.as_mut() {
+            s.close_all();
+        }
+        self.dit = None;
+        self.dit_streamer = None;
     }
 
     pub fn release_vae(&mut self) {
@@ -204,20 +249,63 @@ impl QwenWeb {
             .expect("No device found!")
             .memory_cleanup();
     }
-
-    pub fn release_dit(&mut self) {
-        self.close_blocks();
-        self.model = None;
-        self.streamer = None;
-        self.device
-            .as_ref()
-            .expect("No device found!")
-            .memory_cleanup();
-    }
 }
 
 #[wasm_bindgen]
 impl QwenWeb {
+    pub async fn encode_prompt(&mut self, prompt: &str) -> Result<js_sys::Float32Array, JsValue> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Call load_tokenizer first"))?;
+        let text_encoder = self
+            .text_encoder
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Call load_text_encoder_shell first!"))?;
+        let streamer = self
+            .text_encoder_streamer
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("Text encoder streamer not ready!"))?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Device not initialized!"))?;
+
+        let sys_prompt = "Comprehend and analyze the provided prompt.";
+        let filled_prompt = if prompt.trim().is_empty() {
+            " "
+        } else {
+            prompt
+        };
+        let template = format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            sys_prompt, filled_prompt
+        );
+        let encoding = tokenizer
+            .encode(template, true)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let seq_len = ids.len();
+        log("Creating input_ids...");
+        let input_ids = Tensor::<1, Int>::from_ints(ids.as_slice(), device).reshape([1, seq_len]); // (B, seq_len)
+
+        let pos_ids: Vec<i64> = (0..seq_len as i64).collect();
+        let position_ids = Tensor::<1, Int>::from_ints(pos_ids.as_slice(), device)
+            .reshape([1, 1, seq_len])
+            .repeat_dim(0, 3); // (3, B, seq_len)
+        let attention_mask = Some(generate_autoregressive_mask(1, seq_len, device));
+        let hidden_states = text_encoder.forward(streamer, input_ids, position_ids, attention_mask);
+        let data = hidden_states
+            .into_data_async()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?
+            .try_into_vec::<f32>()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(js_sys::Float32Array::from(data.as_slice()))
+    }
+
     pub async fn generate(
         &mut self,
         prompt_floats: &[f32],
@@ -226,13 +314,13 @@ impl QwenWeb {
         num_steps: usize, // Number of steps
     ) -> Result<js_sys::Float32Array, JsValue> {
         let model = self
-            .model
+            .dit
             .as_ref()
             .ok_or_else(|| JsValue::from_str("call load_shell first"))?;
-        let streamer = self.streamer.as_mut().unwrap();
+        let dit_streamer = self.dit_streamer.as_mut().unwrap();
         let device = self.device.as_ref().unwrap();
 
-        if !streamer.is_ready() {
+        if !dit_streamer.is_ready() {
             return Err(JsValue::from_str("not all block handles are registered"));
         }
 
@@ -255,7 +343,7 @@ impl QwenWeb {
 
         let sigmas: Vec<f32> = schedule(num_steps, target_tokens);
 
-        let mut kv_cache = QwenImageKVCache::new(streamer.num_layers, batch_size, device);
+        let mut kv_cache = QwenImageKVCache::new(dit_streamer.num_layers, batch_size, device);
 
         for step in 0..num_steps {
             let mode = if step == 0 {
@@ -267,7 +355,7 @@ impl QwenWeb {
             let img_mask: Vec<bool> = (0..t_text + slots).map(|i| i >= t_text).collect();
 
             let out = model.forward(
-                streamer,
+                dit_streamer,
                 latents.clone(),
                 encoder_hidden_states.clone(),
                 timestep,
@@ -308,11 +396,12 @@ impl QwenWeb {
 
     pub async fn decode_latents(
         &mut self,
-        latents: &[f32],    // (1, h*w, 64) straight from generate
-        vae_bytes: Vec<u8>, // ignored if a VAE is already loaded via load_vae
-        h: usize,           // latent height
-        w: usize,           // latent width
+        latents: &[f32],
+        vae_bytes: Vec<u8>,
+        h: usize,
+        w: usize,
     ) -> Result<DecodedImage, JsValue> {
+        // latents: (1, h * w, 64)
         log("Loading VAE");
         if self.vae.is_none() {
             self.load_vae(vae_bytes)?;
@@ -328,6 +417,8 @@ impl QwenWeb {
         let z = Tensor::<1>::from_floats(latents, device)
             .reshape([1, h, w, 64])
             .permute([0, 3, 1, 2]);
+
+        // z * self.std.clone() + self.mean.clone()
         let z = LatentNorm::new(&vae.mean, &vae.std, device).denormalize(z);
 
         let out = self.vae.as_ref().expect("VAE not loaded!").decode(z);
@@ -355,5 +446,30 @@ impl QwenWeb {
             height: oh as u32,
             rgba,
         })
+    }
+}
+
+pub struct LatentNorm {
+    mean: Tensor<4>, // (1, 64, 1, 1)
+    std: Tensor<4>,
+}
+
+impl LatentNorm {
+    pub fn new(mean: &[f32], std: &[f32], device: &Device) -> Self {
+        let make = |v: &[f32]| {
+            Tensor::<4>::from_data(TensorData::new(v.to_vec(), [1, v.len(), 1, 1]), device)
+        };
+        Self {
+            mean: make(mean),
+            std: make(std),
+        }
+    }
+
+    pub fn denormalize(&self, z: Tensor<4>) -> Tensor<4> {
+        z * self.std.clone() + self.mean.clone()
+    }
+
+    pub fn normalize(&self, z: Tensor<4>) -> Tensor<4> {
+        (z - self.mean.clone()) / self.std.clone()
     }
 }

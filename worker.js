@@ -7,18 +7,19 @@ const TOKEN_PIXELS = 16;
 
 let qwen = null;
 let bootPromise = null;
-let shellLoaded = false; // shell + streamer + all block handles registered
-let syncHandles = [];    // JS-side refs to the OPFS sync handles
+let tokenizerLoaded = false;
 
-// Forward console output including the Rust log() from lib.rs
-// ("Completed step N") to the page's log panel.
 const nativeLog = console.log.bind(console);
 console.log = (...args) => {
     nativeLog(...args);
     notify('log', args.map((a) => (typeof a === 'string' ? a : String(a))).join(' '));
 };
 
+let wasm;
+const mem = () => console.log(`wasm heap: ${(wasm.memory.buffer.byteLength / 1048576) | 0} MB`);
+
 async function boot() {
+    wasm = await init();
     if (!bootPromise) {
         bootPromise = (async () => {
             await init();
@@ -31,55 +32,80 @@ async function boot() {
     return bootPromise;
 }
 
-// (Re)load the shell and register the block handles. Runs once, then again
-// after every run, because release_dit() drops the streamer and its handles.
+async function loadTokenizer() {
+    await boot();
+    if (!tokenizerLoaded) {
+        console.log('Loading tokenizer.json...');
+        const bytes = await store.readBytes('tokenizer.json');
+        qwen.load_tokenizer(bytes);
+        tokenizerLoaded = true;
+        console.log('Tokenizer ready.');
+    }
+}
+
+async function loadTextEncoder() {
+    await boot();
+    await qwen.load_text_encoder_shell(await store.readBytes('text_encoder/shell.bpk'));
+
+    console.log(`Registering ${store.NUM_LAYERS_TEXT_ENCODER} text encoder layers from OPFS...`);
+    for (let i = 0; i < store.NUM_LAYERS_TEXT_ENCODER; i++) {
+        const sh = await store.openSync(`text_encoder/block_${i}.bpk`);
+        qwen.add_text_encoder_block_handle(sh);
+    }
+    console.log('Text encoder ready (layers stream from disk on demand).');
+}
+
+async function encodePrompt(prompt) {
+    await loadTokenizer();
+    await loadTextEncoder();
+    console.log('Encoding prompt with the text encoder...');
+    return await qwen.encode_prompt(prompt); 
+}
+
 async function loadShell() {
     await boot();
-    await qwen.load_shell(await store.readBytes('shell.bpk'));
+    await qwen.load_dit_shell(await store.readBytes('shell.bpk'));
 
-    const layers = qwen.num_layers();
-    if (layers !== store.NUM_LAYERS) {
-        throw new Error(`Shell exposes ${layers} layers, but store.NUM_LAYERS is ${store.NUM_LAYERS}`);
+    const layers = qwen.num_dit_layers();
+    if (layers !== store.NUM_LAYERS_DIT) {
+        throw new Error(`Shell exposes ${layers} layers, but store.NUM_LAYERS_DIT is ${store.NUM_LAYERS_DIT}`);
     }
 
-    console.log(`Registering ${store.NUM_LAYERS} blocks from OPFS...`);
-    const handles = [];
-    try {
-        for (let i = 0; i < store.NUM_LAYERS; i++) {
-            const sh = await store.openSync(`block_${i}.bpk`); // exclusive lock, worker-only
-            handles.push(sh);
-            qwen.add_block_handle(sh); // layer order == registration order
-        }
-    } catch (e) {
-        for (const h of handles) { try { h.close(); } catch { } }
-        throw e;
+    console.log(`Registering ${store.NUM_LAYERS_DIT} blocks from OPFS...`);
+    for (let i = 0; i < store.NUM_LAYERS_DIT; i++) {
+        const sh = await store.openSync(`block_${i}.bpk`);
+        qwen.add_dit_block_handle(sh);
     }
-
-    syncHandles = handles;
-    shellLoaded = true;
     console.log('Model ready (blocks stream from disk on demand).');
 }
 
-async function generate({ widthPx, heightPx, steps }) {
+
+async function generate({ prompt, widthPx, heightPx, steps }) {
     try {
         await boot();
-        if (!shellLoaded) await loadShell();
 
-        const h = Math.round(heightPx / TOKEN_PIXELS); // token grid
+        // Text encoder
+        const promptEmbeds = await encodePrompt(prompt);
+        qwen.release_text_encoder();
+        console.log('Text encoder memory released.');
+        // mem();
+
+        // DiT
+        const h = Math.round(heightPx / TOKEN_PIXELS); 
         const w = Math.round(widthPx / TOKEN_PIXELS);
 
         console.log(`Generating ${h}x${w} tokens, ${steps} steps...`);
-        const promptEmbeds = await store.readFloats('prompt_embeds.bin');
-
+        await loadShell();
+        
         const t0 = performance.now();
         const latents = await qwen.generate(promptEmbeds, h, w, steps);
         console.log(`Denoising done in ${((performance.now() - t0) / 1000).toFixed(2)}s`);
-
-        qwen.release_dit(); // frees the DiT, closes the block handles
-        shellLoaded = false;
-
-        console.log('Decoding latents with VAE...');
         
+        qwen.release_dit();
+        // mem();
+
+        // VAE decode
+        console.log('Decoding latents with VAE...');
         const vaeBytes = await store.readBytes('vae.bpk');
         const image = await qwen.decode_latents(latents, vaeBytes, h, w);
 
@@ -90,23 +116,19 @@ async function generate({ widthPx, heightPx, steps }) {
         return { value, transfer: [rgba.buffer] };
     } finally {
         if (qwen) {
+            try { qwen.release_text_encoder(); } catch { }
             try { qwen.release_dit(); } catch { }
             try { qwen.release_vae(); } catch { }
         }
-        for (const h of syncHandles) { try { h.close(); } catch { } }
-        syncHandles = [];
-        shellLoaded = false;
     }
 }
 
 async function clearCache() {
     if (qwen) {
+        try { qwen.release_text_encoder(); } catch { }
         try { qwen.release_dit(); } catch { }
         try { qwen.release_vae(); } catch { }
     }
-    for (const h of syncHandles) { try { h.close(); } catch { } }
-    syncHandles = [];
-    shellLoaded = false;
     await store.wipe();
 }
 

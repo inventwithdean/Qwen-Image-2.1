@@ -7,6 +7,7 @@ const statusEl = $('status');
 const logsEl = $('logs');
 const runBtn = $('run');
 const saveBtn = $('save');
+const promptInput = $('prompt');
 
 const stepsSlider = $('steps');
 const stepsOut = $('steps-out');
@@ -35,14 +36,15 @@ function setBusy(busy) {
     document.body.classList.toggle('busy', busy);
     stepsSlider.disabled = busy;
     sizeSelector.disabled = busy;
+    promptInput.disabled = busy;
 }
 
 function showImage({ width, height, rgba }) {
-    canvas.width = width; 
+    canvas.width = width;
     canvas.height = height;
-    
+
     canvas.style.maxWidth = '100%';
-    canvas.style.maxHeight = '100%'; 
+    canvas.style.maxHeight = '100%';
     canvas.style.objectFit = 'contain';
 
     ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
@@ -52,11 +54,12 @@ runBtn.addEventListener('click', async () => {
     setBusy(true);
     saveBtn.disabled = true;
     statusEl.textContent = 'Working...';
-    
+
     const [widthPx, heightPx] = sizeSelector.value.split('x').map(Number);
-    
+
     try {
         const image = await api.call('generate', {
+            prompt: promptInput.value.trim(),
             widthPx,
             heightPx,
             steps: Number(stepsSlider.value),

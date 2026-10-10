@@ -43,10 +43,9 @@ export function notify(event, data) {
     self.postMessage({ event, data });
 }
 
-// Handlers take one `arg` and return their result.
 export function createServer(handlers) {
     self.addEventListener('message', async ({ data }) => {
-        if (!data || data.id === undefined) return; // not an RPC call
+        if (!data || data.id === undefined) return;
         try {
             const handler = handlers[data.method];
             if (!handler) throw new Error(`Unknown method: ${data.method}`);

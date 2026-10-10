@@ -1,10 +1,12 @@
 const CACHE_DIR = 'qwen-cache';
 const CACHE_VERSION = 'v1';
 
-export const NUM_LAYERS = 32; // transformer blocks
+export const NUM_LAYERS_DIT = 32;
+export const NUM_LAYERS_TEXT_ENCODER = 36;
 
 // OPFS name -> source URL.
-const urlFor = (name) => `https://huggingface.co/inventwithdean/Qwen-Image-2.1/resolve/main/${name}`;
+// const urlFor = (name) => `https://huggingface.co/inventwithdean/Qwen-Image-2.1/resolve/main/${name}`;
+const urlFor = (name) => `./out/${name}`;
 
 let dirPromise = null;
 
@@ -39,9 +41,14 @@ async function openCacheDir() {
 // Returns an OPFS file handle, downloading the file first if needed.
 // createWritable() writes to a swap file and commits only on close(), so a
 // non-empty file is always a fully downloaded one.
+//
+// `name` may carry repo subdirectories ("text_encoder/shell.bpk"): it is used
+// as the remote path, while the OPFS entry is flattened ('/' -> '__') because
+// OPFS file names cannot contain slashes.
 export async function ensureCached(name) {
     const dir = await cacheDir();
-    const fh = await dir.getFileHandle(name, { create: true });
+    const opfsName = name.replaceAll('/', '__');
+    const fh = await dir.getFileHandle(opfsName, { create: true });
     if ((await fh.getFile()).size > 0) return fh;
 
     console.log(`Downloading ${name} -> OPFS`);
@@ -51,7 +58,6 @@ export async function ensureCached(name) {
     return fh;
 }
 
-// Whole-file reads for things that must sit in RAM anyway (shell, VAE).
 export async function readBytes(name) {
     const file = await (await ensureCached(name)).getFile();
     return new Uint8Array(await file.arrayBuffer());
@@ -62,7 +68,6 @@ export async function readFloats(name) {
     return new Float32Array(await file.arrayBuffer());
 }
 
-// Worker-only: sync access handle for streaming the big block files.
 export async function openSync(name) {
     return (await ensureCached(name)).createSyncAccessHandle();
 }

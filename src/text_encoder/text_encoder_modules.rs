@@ -2,8 +2,10 @@ use burn::{
     Tensor,
     config::Config,
     module::{Module, Param},
-    nn::Linear,
-    tensor::{Bool, Device, Int, module::attention, ops::AttentionModuleOptions, s},
+    nn::{Linear, LinearConfig},
+    tensor::{
+        Bool, Device, Int, activation::silu, module::attention, ops::AttentionModuleOptions, s,
+    },
 };
 
 fn rotate_half(x: Tensor<4>) -> Tensor<4> {
@@ -70,12 +72,9 @@ impl Qwen3VLTextRotaryEmbedding {
 }
 
 #[derive(Config, Debug)]
-struct Qwen3VLTextRotaryEmbeddingConfig {
-    #[config(default = 5_000_000.0)]
+pub struct Qwen3VLTextRotaryEmbeddingConfig {
     rope_base: f32,
-    #[config(default = 128)]
     head_dim: usize,
-    #[config(default = "[24, 20, 20]")]
     mrope_section: [usize; 3],
 }
 
@@ -119,7 +118,6 @@ impl Qwen3VLTextRMSNorm {
 #[derive(Config, Debug)]
 pub struct Qwen3VLTextRMSNormConfig {
     hidden_size: usize,
-    #[config(default = 1e-6)]
     eps: f32,
 }
 
@@ -133,7 +131,7 @@ impl Qwen3VLTextRMSNormConfig {
 }
 
 fn repeat_kv(kv: Tensor<4>, repeat: usize) -> Tensor<4> {
-    // Repeats key and values repeat times at 1st dim
+    // Repeats key and values repeat times
     // kv: (B, num_kv_heads, seq_len, head_dim)
     let [b, num_kv_heads, seq_len, head_dim] = kv.dims();
     let kv = kv.unsqueeze_dim::<5>(2); // (B, num_kv_heads, 1, seq_len, head_dim)
@@ -150,6 +148,9 @@ pub struct Qwen3VLTextAttention {
     o_proj: Linear,
     q_norm: Qwen3VLTextRMSNorm,
     k_norm: Qwen3VLTextRMSNorm,
+    head_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
 }
 
 impl Qwen3VLTextAttention {
@@ -168,9 +169,9 @@ impl Qwen3VLTextAttention {
         let key = self.k_proj.forward(hidden_states.clone());
         let value = self.v_proj.forward(hidden_states.clone());
 
-        let head_dim = 128_usize;
-        let num_heads = 32_usize;
-        let num_kv_heads = 8_usize;
+        let head_dim = self.head_dim;
+        let num_heads = self.num_heads;
+        let num_kv_heads = self.num_kv_heads;
 
         let query = query.reshape([b, seq_len, num_heads, head_dim]);
         let key = key.reshape([b, seq_len, num_kv_heads, head_dim]);
@@ -198,8 +199,140 @@ impl Qwen3VLTextAttention {
             AttentionModuleOptions::default(),
         );
         let out = out.swap_dims(1, 2); // (B, seq_len, num_heads, head_dim)
-        let out = out.reshape([b, seq_len, hidden_size]);
+        let out = out.reshape([b, seq_len, hidden_size]); // (B, seq_len, hidden_size)
         self.o_proj.forward(out)
     }
 }
 
+// attention_bias = false
+#[derive(Config, Debug)]
+pub struct Qwen3VLTextAttentionConfig {
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    rms_norm_eps: f32,
+}
+
+impl Qwen3VLTextAttentionConfig {
+    pub fn init(&self, device: &Device) -> Qwen3VLTextAttention {
+        Qwen3VLTextAttention {
+            q_proj: LinearConfig::new(self.hidden_size, self.num_heads * self.head_dim)
+                .with_bias(false)
+                .init(device),
+            k_proj: LinearConfig::new(self.hidden_size, self.num_kv_heads * self.head_dim)
+                .with_bias(false)
+                .init(device),
+            v_proj: LinearConfig::new(self.hidden_size, self.num_kv_heads * self.head_dim)
+                .with_bias(false)
+                .init(device),
+            o_proj: LinearConfig::new(self.num_heads * self.head_dim, self.hidden_size)
+                .with_bias(false)
+                .init(device),
+            q_norm: Qwen3VLTextRMSNormConfig::new(self.head_dim, self.rms_norm_eps).init(device),
+            k_norm: Qwen3VLTextRMSNormConfig::new(self.head_dim, self.rms_norm_eps).init(device),
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Qwen3VLTextMLP {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl Qwen3VLTextMLP {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        let gate = silu(self.gate_proj.forward(x.clone()));
+        let up = self.up_proj.forward(x);
+        self.down_proj.forward(gate * up)
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct Qwen3VLTextMLPConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+}
+
+impl Qwen3VLTextMLPConfig {
+    pub fn init(&self, device: &Device) -> Qwen3VLTextMLP {
+        Qwen3VLTextMLP {
+            gate_proj: LinearConfig::new(self.hidden_size, self.intermediate_size)
+                .with_bias(false)
+                .init(device),
+            up_proj: LinearConfig::new(self.hidden_size, self.intermediate_size)
+                .with_bias(false)
+                .init(device),
+            down_proj: LinearConfig::new(self.intermediate_size, self.hidden_size)
+                .with_bias(false)
+                .init(device),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct Qwen3VLTextDecoderLayer {
+    self_attn: Qwen3VLTextAttention,
+    mlp: Qwen3VLTextMLP,
+    input_layernorm: Qwen3VLTextRMSNorm,
+    post_attention_layernorm: Qwen3VLTextRMSNorm,
+}
+
+impl Qwen3VLTextDecoderLayer {
+    pub fn forward(
+        &self,
+        hidden_states: Tensor<3>,
+        position_embeddings: (Tensor<3>, Tensor<3>),
+        attention_mask: Option<Tensor<3, Bool>>,
+    ) -> Tensor<3> {
+        let residual = hidden_states.clone();
+        let hidden_states = self.input_layernorm.forward(hidden_states);
+
+        let hidden_states =
+            self.self_attn
+                .forward(hidden_states, position_embeddings, attention_mask);
+        let hidden_states = residual + hidden_states;
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_layernorm.forward(hidden_states);
+        let hidden_states = self.mlp.forward(hidden_states);
+        residual + hidden_states
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct Qwen3VLTextDecoderLayerConfig {
+    hidden_size: usize,
+    head_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    intermediate_size: usize,
+    rms_norm_eps: f32,
+}
+
+impl Qwen3VLTextDecoderLayerConfig {
+    pub fn init(&self, device: &Device) -> Qwen3VLTextDecoderLayer {
+        Qwen3VLTextDecoderLayer {
+            self_attn: Qwen3VLTextAttentionConfig::new(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.hidden_size,
+                self.rms_norm_eps,
+            )
+            .init(device),
+            mlp: Qwen3VLTextMLPConfig::new(self.hidden_size, self.intermediate_size).init(device),
+            input_layernorm: Qwen3VLTextRMSNormConfig::new(self.hidden_size, self.rms_norm_eps)
+                .init(device),
+            post_attention_layernorm: Qwen3VLTextRMSNormConfig::new(
+                self.hidden_size,
+                self.rms_norm_eps,
+            )
+            .init(device),
+        }
+    }
+}
