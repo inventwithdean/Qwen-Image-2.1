@@ -3,6 +3,9 @@
 
 This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) using the Burn framework. The model currently sits at Rank 1 of [Text-to-Image Arena](https://arena.ai/leaderboard/text-to-image?license=open-source) in Open Source category as of October, 2026.
 
+
+TODO: Update Readme to communicate the WebGPU port.
+
 #### Sample Generations: 
 
 ![A sample image generated](./generations/image_1.png)
@@ -24,7 +27,7 @@ This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwe
 ## Components
 - DiT (Completed)
 - VAE (Completed)
-- Text Encoder (TODO)
+- Text Encoder (Completed)
 
 ## Flash Attention
 Flash attention (used in DiT) doesn't require materializing full N x N matrix hence saving us a lot of VRAM.
