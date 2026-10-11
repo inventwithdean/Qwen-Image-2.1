@@ -109,6 +109,8 @@
             position: relative;
             z-index: 10;
             image-rendering: pixelated;
+            background-image: repeating-conic-gradient(#cbd5e1 0% 25%, #f1f5f9 0% 50%);
+            background-size: 16px 16px;
         }
 
         body.busy #status::before {
@@ -208,7 +210,7 @@
         <div id="stage"
             class="relative w-full flex justify-center items-center bg-gray-50 border-4 border-black rounded-3xl p-2 shadow-brutal mb-8 h-[40vh] md:h-[50vh] overflow-hidden">
             <canvas id="preview" width="512" height="512"
-                class="max-w-full max-h-full w-auto h-auto object-contain border-4 border-black rounded-2xl shadow-brutal-sm bg-white"></canvas>
+                class="max-w-full max-h-full w-auto h-auto object-contain border-4 border-black rounded-2xl shadow-brutal-sm"></canvas>
         </div>
 
         <div class="relative">
