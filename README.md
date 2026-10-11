@@ -3,6 +3,7 @@
 
 This is a Rust implementation of the [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) using the Burn framework. The model currently sits at Rank 1 of [Text-to-Image Arena](https://arena.ai/leaderboard/text-to-image?license=open-source) in Open Source category as of October, 2026.
 
+Live: [Hugging Face Space](https://inventwithdean-qwen-image-2-1-webgpu.static.hf.space/)
 
 TODO: Update Readme to communicate the WebGPU port.
 
