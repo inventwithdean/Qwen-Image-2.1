@@ -1,5 +1,4 @@
 // talks to the page only through rpc.js.
-// Compiled .wasm uploaded to cdn.mygpu.io
 import init, { QwenWeb } from './pkg/qwen_image.js';
 import { createServer, notify } from './rpc.js';
 import * as store from './store.js';
