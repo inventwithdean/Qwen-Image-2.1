@@ -5,8 +5,8 @@ export const NUM_LAYERS_DIT = 32;
 export const NUM_LAYERS_TEXT_ENCODER = 36;
 
 // OPFS name -> source URL.
-// const urlFor = (name) => `https://huggingface.co/inventwithdean/Qwen-Image-2.1/resolve/main/${name}`;
-const urlFor = (name) => `./out/${name}`;
+const urlFor = (name) => `https://huggingface.co/inventwithdean/Qwen-Image-2.1/resolve/main/${name}`;
+// const urlFor = (name) => `./out/${name}`;
 
 let dirPromise = null;
 
