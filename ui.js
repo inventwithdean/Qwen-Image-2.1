@@ -13,7 +13,7 @@ const stepsSlider = $('steps');
 const stepsOut = $('steps-out');
 const sizeSelector = $('size-selector');
 
-const worker = new Worker('./qwen-image-2.1-web-assets/worker.js', { type: 'module' });
+const worker = new Worker('./worker.js', { type: 'module' });
 const api = createClient(worker);
 
 api.on('log', (line) => {

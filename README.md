@@ -2,7 +2,7 @@
 
 A pure Rust inference engine for [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1), running entirely in your browser using the Burn framework and WebGPU. As of October 2026, this model holds the Rank 1 spot on the Text-to-Image Arena in the Open Source category.
 
-#### Live: [https://mygpu.io/qwen-image-2.1](https://mygpu.io/qwen-image-2.1)
+#### Live: [Hugging Face Space](https://inventwithdean-qwen-image-2-1-webgpu.static.hf.space/)
 
 #### Sample Generations: 
 
