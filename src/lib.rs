@@ -115,26 +115,25 @@ impl QwenWeb {
         Ok(())
     }
 
-    pub fn load_tokenizer(&mut self, tokenizer_bytes: &[u8]) -> Result<(), JsValue> {
+    pub fn load_tokenizer(&mut self, handle: streamer::SyncHandle) -> Result<(), JsValue> {
         log("Loading tokenizer...");
-        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let bytes = streamer::read_and_close(handle);
+        let tokenizer =
+            Tokenizer::from_bytes(&bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
         self.tokenizer = Some(tokenizer);
         log("Tokenizer loaded successfully!");
         Ok(())
     }
 
-    pub fn load_text_encoder_shell(
-        &mut self,
-        text_encoder_shell_bytes: Vec<u8>,
-    ) -> Result<(), JsValue> {
+    pub fn load_text_encoder_shell(&mut self, handle: streamer::SyncHandle) -> Result<(), JsValue> {
         log("Loading Text Encoder Shell...");
+        // Reading first so the handle is always closed even if the device check fails.
+        let record = streamer::take_record(handle).map_err(|e| JsValue::from_str(&e))?;
+
         let device = self
             .device
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Device not initialized!"))?;
-        let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(text_encoder_shell_bytes))
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         log("Preparing Text Encoder Block Streamer...");
         let streamer = streamer::QwenImageTextEncoderStreamerWeb::new_empty(device);
@@ -169,14 +168,14 @@ impl QwenWeb {
         Ok(())
     }
 
-    pub async fn load_dit_shell(&mut self, shell_bytes: Vec<u8>) -> Result<(), JsValue> {
+    pub async fn load_dit_shell(&mut self, handle: streamer::SyncHandle) -> Result<(), JsValue> {
         log("Loading DiT shell...");
+        let shell_record = streamer::take_record(handle).map_err(|e| JsValue::from_str(&e))?;
+
         let device = self.device.as_ref().expect("Call init_device first!");
         let config = QwenImageTransformerModelConfig::new([16, 56, 56]);
         let mut model = config.clone().with_num_layers(0).init(&device);
 
-        let shell_record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(shell_bytes))
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         model = model.load_record(shell_record);
 
         log("Preparing Transformer Block Streamer...");
@@ -210,14 +209,13 @@ impl QwenWeb {
         Ok(())
     }
 
-    fn load_vae(&mut self, vae_bytes: Vec<u8>) -> Result<(), JsValue> {
+    fn load_vae(&mut self, handle: streamer::SyncHandle) -> Result<(), JsValue> {
         log("Loading VAE...");
+        let record = streamer::take_record(handle).map_err(|e| JsValue::from_str(&e))?;
         let device = self
             .device
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Device not initialized!"))?;
-        let record = ModuleRecord::from_bytes(Bytes::from_bytes_vec(vae_bytes))
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         self.vae = Some(
             AutoencoderKLQwenImageConfig::new()
                 .init(device)
@@ -397,14 +395,16 @@ impl QwenWeb {
     pub async fn decode_latents(
         &mut self,
         latents: &[f32],
-        vae_bytes: Vec<u8>,
+        vae_handle: streamer::SyncHandle,
         h: usize,
         w: usize,
     ) -> Result<DecodedImage, JsValue> {
         // latents: (1, h * w, 64)
         log("Loading VAE");
         if self.vae.is_none() {
-            self.load_vae(vae_bytes)?;
+            self.load_vae(vae_handle)?;
+        } else {
+            vae_handle.close();
         }
         log("Loaded VAE!");
         let vae = self.vae.as_ref().expect("VAE Not loaded!");

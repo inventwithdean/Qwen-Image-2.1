@@ -22,7 +22,7 @@ extern "C" {
     fn read_at(this: &SyncHandle, buf: &mut [u8], opts: &JsValue) -> f64;
 
     #[wasm_bindgen(method, js_name = close)]
-    fn close(this: &SyncHandle);
+    pub fn close(this: &SyncHandle);
 }
 
 fn read_opts(at: usize) -> JsValue {
@@ -31,8 +31,8 @@ fn read_opts(at: usize) -> JsValue {
     o.into()
 }
 
-// Synchronously read one block file from disk into wasm memory.
-fn read_record(handle: &SyncHandle) -> ModuleRecord {
+// Synchronously read the whole file behind a handle into wasm memory
+pub fn read_bytes(handle: &SyncHandle) -> Vec<u8> {
     let size = handle.get_size() as usize;
     let mut buf = vec![0u8; size];
 
@@ -43,8 +43,26 @@ fn read_record(handle: &SyncHandle) -> ModuleRecord {
         off += n;
     }
 
-    ModuleRecord::from_bytes(Bytes::from_bytes_vec(buf))
+    buf
+}
+
+/// Reads record without closing the handle
+fn read_record(handle: &SyncHandle) -> ModuleRecord {
+    ModuleRecord::from_bytes(Bytes::from_bytes_vec(read_bytes(handle)))
         .unwrap_or_else(|e| panic!("bad record: {e:?}"))
+}
+
+/// Copies bytes from the handle to wasm memory and closes the handle
+pub fn read_and_close(handle: SyncHandle) -> Vec<u8> {
+    let bytes = read_bytes(&handle);
+    handle.close();
+    bytes
+}
+
+/// Extracts record and closes the handle
+pub fn take_record(handle: SyncHandle) -> Result<ModuleRecord, String> {
+    let bytes = read_and_close(handle);
+    ModuleRecord::from_bytes(Bytes::from_bytes_vec(bytes)).map_err(|e| e.to_string())
 }
 
 pub struct QwenImageBlockStreamerWeb {
