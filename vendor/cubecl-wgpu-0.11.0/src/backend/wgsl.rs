@@ -1,0 +1,125 @@
+use cubecl_core::{Compiler, prelude::Visibility, server::KernelArguments};
+use cubecl_core::{
+    WgpuCompilationOptions,
+    ir::{ElemType, UIntKind},
+};
+use cubecl_ir::{DeviceProperties, Type};
+use wgpu::Features;
+
+use crate::WgslCompiler;
+
+pub fn bindings(
+    repr: &<WgslCompiler as Compiler>::Representation,
+    args: &KernelArguments,
+) -> (Vec<Visibility>, usize) {
+    let mut bindings = repr
+        .buffers
+        .iter()
+        .map(|vis| {
+            // When slices are shared, it needs to be read-write if ANY of the slices is read-write,
+            // and since we can't be sure, we'll assume everything is read-write.
+            if cubecl_server::memory_management::EXCLUSIVE_MEMORY_ONLY {
+                *vis
+            } else {
+                Visibility::ReadWrite
+            }
+        })
+        .collect::<Vec<_>>();
+    if !args.info.data.is_empty() {
+        bindings.push(Visibility::Read);
+    }
+    (bindings, 0)
+}
+
+/// Request a WGSL device, returning device creation failures.
+pub async fn try_request_device(
+    adapter: &wgpu::Adapter,
+) -> Result<(wgpu::Device, wgpu::Queue), crate::WgpuInitError> {
+    let limits = adapter.limits();
+    adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: None,
+            required_features: adapter
+                .features()
+                .difference(Features::MAPPABLE_PRIMARY_BUFFERS),
+            required_limits: limits,
+            // The default is MemoryHints::Performance, which tries to do some bigger
+            // block allocations. However, we already batch allocations, so we
+            // can use MemoryHints::MemoryUsage to lower memory usage.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            // SAFETY: Enabling experimental passthrough shaders.
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+        })
+        .await
+        .map_err(|err| crate::WgpuInitError::RequestDevice {
+            message: err.to_string(),
+        })
+}
+
+pub fn register_wgsl_features(
+    adapter: &wgpu::Adapter,
+    props: &mut cubecl_ir::DeviceProperties,
+    comp_options: &mut WgpuCompilationOptions,
+) {
+    register_types(props, adapter);
+    if props.supports_type(ElemType::UInt(UIntKind::U64)) {
+        comp_options.supports_u64 = true;
+    }
+}
+
+pub fn register_types(props: &mut DeviceProperties, adapter: &wgpu::Adapter) {
+    use cubecl_core::ir::{AddressType, ElemType, FloatKind, IntKind};
+    use cubecl_ir::features::*;
+
+    props.register_address_type(AddressType::U32);
+
+    let supported_types = [
+        ElemType::Index,
+        ElemType::UInt(UIntKind::U32),
+        ElemType::Int(IntKind::I32),
+        ElemType::Float(FloatKind::F32),
+        ElemType::Float(FloatKind::Flex32),
+        ElemType::Bool,
+    ];
+
+    let supported_atomic_types = [ElemType::Int(IntKind::I32), ElemType::UInt(UIntKind::U32)];
+
+    for ty in supported_types {
+        props.register_type_usage(ty, TypeUsage::all())
+    }
+
+    // Converted through the software polyfill, packed four to a u32. Buffers of fp8 do work at
+    // any multiple of four lanes, but `TypeUsage` is per element type and cannot say "buffer,
+    // but never scalar", and a scalar fp8 has no WGSL type at all. Callers that want fp8 in
+    // memory bind it as `u32` words and reinterpret, which needs no buffer usage.
+    for ty in [FloatKind::E4M3, FloatKind::E5M2, FloatKind::UE8M0] {
+        props.register_type_usage(ElemType::Float(ty), TypeUsage::Conversion);
+    }
+
+    for ty in supported_atomic_types {
+        props.register_atomic_type_usage(
+            Type::atomic(ty),
+            AtomicUsage::LoadStore | AtomicUsage::Exchange | AtomicUsage::Add,
+        );
+    }
+
+    let feats = adapter.features();
+
+    if feats.contains(wgpu::Features::SHADER_INT64) {
+        props.register_type_usage(ElemType::Int(IntKind::I64), TypeUsage::all());
+        props.register_type_usage(ElemType::UInt(UIntKind::U64), TypeUsage::all());
+    }
+    if feats.contains(wgpu::Features::SHADER_F64) {
+        props.register_type_usage(ElemType::Float(FloatKind::F64), TypeUsage::all());
+    }
+    if feats.contains(wgpu::Features::SHADER_F16) {
+        props.register_type_usage(ElemType::Float(FloatKind::F16), TypeUsage::all());
+    }
+    if feats.contains(wgpu::Features::SHADER_FLOAT32_ATOMIC) {
+        props.register_atomic_type_usage(
+            Type::atomic(ElemType::Float(FloatKind::F32)),
+            AtomicUsage::LoadStore | AtomicUsage::Exchange | AtomicUsage::Add,
+        );
+    }
+}

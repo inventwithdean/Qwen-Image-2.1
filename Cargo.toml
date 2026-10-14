@@ -26,3 +26,4 @@ features = ["console"]
 
 [patch.crates-io]
 burn-cubecl = { path = "vendor/burn-cubecl-0.22.0" }
+cubecl-wgpu = { path = "vendor/cubecl-wgpu-0.11.0" }

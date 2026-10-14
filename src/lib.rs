@@ -8,8 +8,7 @@ pub mod vae;
 use burn::{
     module::Module,
     nn::attention::generate_autoregressive_mask,
-    store::ModuleRecord,
-    tensor::{Bytes, Device, Distribution, FloatDType, Int, Tensor, TensorData, s},
+    tensor::{Device, Distribution, FloatDType, Int, Tensor, TensorData, s},
 };
 use qwen_image::{QwenImageTransformerModel, QwenImageTransformerModelConfig};
 use qwen_image_modules::{KvCacheMode, QwenImageKVCache};
@@ -157,14 +156,14 @@ impl QwenWeb {
             .text_encoder_streamer
             .as_mut()
             .ok_or_else(|| JsValue::from_str("call load_shell first"))?;
-        let idx = streamer
+        let _idx = streamer
             .add_handle(handle)
             .map_err(|e| JsValue::from_str(&e))?;
-        log(&format!(
-            "   - Registered block {} ({:.1} MiB on disk)",
-            idx,
-            streamer.block_size(idx) as f64 / (1024.0 * 1024.0)
-        ));
+        // log(&format!(
+        //     "   - Registered block {} ({:.1} MiB on disk)",
+        //     idx,
+        //     streamer.block_size(idx) as f64 / (1024.0 * 1024.0)
+        // ));
         Ok(())
     }
 
@@ -198,14 +197,14 @@ impl QwenWeb {
             .dit_streamer
             .as_mut()
             .ok_or_else(|| JsValue::from_str("call load_shell first"))?;
-        let idx = streamer
+        let _idx = streamer
             .add_handle(handle)
             .map_err(|e| JsValue::from_str(&e))?;
-        log(&format!(
-            "   - Registered block {} ({:.1} MiB on disk)",
-            idx,
-            streamer.block_size(idx) as f64 / (1024.0 * 1024.0)
-        ));
+        // log(&format!(
+        //     "   - Registered block {} ({:.1} MiB on disk)",
+        //     idx,
+        //     streamer.block_size(idx) as f64 / (1024.0 * 1024.0)
+        // ));
         Ok(())
     }
 
@@ -224,28 +223,53 @@ impl QwenWeb {
         Ok(())
     }
 
+    pub fn report_mem(&self, tag: &str) {
+        if let Some(dev) = self.device.as_ref() {
+            if let Some(u) = dev.memory_pool_usage() {
+                log(&format!(
+                    "[{tag}] in_use={} reserved={} padding={} allocs={}",
+                    u.bytes_in_use, u.bytes_reserved, u.bytes_padding, u.number_allocs
+                ));
+            }
+        }
+    }
+
     pub fn release_text_encoder(&mut self) {
         if let Some(s) = self.text_encoder_streamer.as_mut() {
             s.close_all();
         }
+        // self.report_mem("Before releasing text_encoder");
         self.text_encoder = None;
         self.text_encoder_streamer = None;
+        self.device
+            .as_ref()
+            .expect("No device found!")
+            .memory_cleanup();
+        // self.report_mem("After releasing text_encoder");
     }
 
     pub fn release_dit(&mut self) {
         if let Some(s) = self.dit_streamer.as_mut() {
             s.close_all();
         }
+        // self.report_mem("Before releasing DiT");
         self.dit = None;
         self.dit_streamer = None;
-    }
-
-    pub fn release_vae(&mut self) {
-        self.vae = None;
         self.device
             .as_ref()
             .expect("No device found!")
             .memory_cleanup();
+        // self.report_mem("After releasing DiT");
+    }
+
+    pub fn release_vae(&mut self) {
+        self.vae = None;
+        // self.report_mem("Before releasing VAE");
+        self.device
+            .as_ref()
+            .expect("No device found!")
+            .memory_cleanup();
+        // self.report_mem("After releasing VAE");
     }
 }
 
@@ -400,7 +424,6 @@ impl QwenWeb {
         w: usize,
     ) -> Result<DecodedImage, JsValue> {
         // latents: (1, h * w, 64)
-        log("Loading VAE");
         if self.vae.is_none() {
             self.load_vae(vae_handle)?;
         } else {

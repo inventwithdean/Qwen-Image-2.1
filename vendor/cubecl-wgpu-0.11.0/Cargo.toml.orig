@@ -1,0 +1,141 @@
+[package]
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+categories = ["science"]
+description = "WGPU runtime for the CubeCL"
+edition.workspace = true
+keywords = ["gpu", "wgpu", "webgpu", "gpgpu"]
+license.workspace = true
+name = "cubecl-wgpu"
+readme.workspace = true
+repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-wgpu"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = [
+    "cubecl-server/default",
+    "cubecl-common/default",
+    "cubecl-core/default",
+]
+exclusive-memory-only = ["cubecl-server/exclusive-memory-only"]
+persistence = ["cubecl-server/persistence"]
+std = [
+    "cubecl-server/std",
+    "cubecl-common/std",
+    "cubecl-core/std",
+    "cubecl-cpp/std",
+    "cubecl-opt/std",
+    "pliron/std",
+    "sanitize-filename",
+]
+msl = [
+    "cubecl-cpp/metal",
+    "dep:objc2",
+    "dep:objc2-foundation",
+]
+profile-tracy = ["tracy-client"]
+spirv = ["cubecl-spirv", "ash", "tracel-ash", "cubecl-common/hash"]
+
+
+deny-validation-errors = ["wgpu-hal/validation_canary"]
+pliron-dump = ["std", "cubecl-cpp/pliron-dump", "cubecl-spirv?/pliron-dump"]
+vulkan-validate = []
+
+renderdoc = ["std", "dep:renderdoc"]
+tracing = [
+    "dep:tracing",
+    "cubecl-server/tracing",
+    "cubecl-common/tracing",
+    "cubecl-core/tracing",
+]
+
+[dependencies]
+# Runtime Deps
+log = { workspace = true }
+tracing = { workspace = true, features = ["attributes"], optional = true }
+
+cubecl-common = { path = "../cubecl-common", version = "0.11.0", default-features = false }
+cubecl-core = { path = "../cubecl-core", version = "0.11.0", default-features = false }
+cubecl-environment = { path = "../cubecl-environment", version = "0.11.0", default-features = false }
+cubecl-ir = { path = "../cubecl-ir", version = "0.11.0", default-features = false }
+cubecl-opt = { path = "../cubecl-opt", version = "0.11.0", default-features = false }
+cubecl-monitoring = { path = "../cubecl-monitoring", version = "0.11.0", default-features = false, features = [
+    "amdgpu-busy-percent",
+    "gpu-engine-counters",
+    "intel-idle-residency",
+    "io-accelerator",
+    "nvml",
+] }
+cubecl-server = { path = "../cubecl-server", version = "0.11.0", default-features = false }
+derive_more = { workspace = true }
+half = { workspace = true }
+itertools = { workspace = true }
+pliron = { workspace = true }
+sanitize-filename = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tracy-client = { workspace = true, optional = true }
+
+# SPIR-V
+ash = { workspace = true, optional = true }
+cubecl-spirv = { path = "../cubecl-spirv", version = "0.11.0", optional = true }
+tracel-ash = { workspace = true, optional = true }
+
+# Metal
+cubecl-cpp = { path = "../cubecl-cpp", version = "0.11.0", features = [
+    "metal",
+], optional = true }
+
+# Validation
+wgpu-hal = { workspace = true, optional = true }
+
+bytemuck = { workspace = true }
+
+derive-new = { workspace = true }
+hashbrown = { workspace = true }
+
+cfg-if = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen-futures = { workspace = true }
+
+## wgpu dependency for platforms other than macOS
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+renderdoc = { workspace = true, optional = true }
+wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
+
+## For development on wgpu uncomment this one and make it point to your local wgpu repo
+# wgpu = { path = "../../../../tracel/wgpu/wgpu", features = ["fragile-send-sync-non-atomic-wasm"]}
+## On macOS, the `vulkan-portability` feature is required due to the MoltenVK translation layer.
+# To install MoltenVK, install the VulkanSDK: https://vulkan.lunarg.com/sdk/home#mac
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = [
+    "vulkan-portability",
+    "fragile-send-sync-non-atomic-wasm",
+] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLLibrary"] }
+
+## For development on wgpu uncomment this one and make it point to your local wgpu repo
+# wgpu = { path = "../../../../tracel/wgpu/wgpu", features = ["vulkan-portability", "fragile-send-sync-non-atomic-wasm"]}
+
+[dev-dependencies]
+cubecl-core = { path = "../cubecl-core", version = "0.11.0", features = [
+    "export_tests",
+] }
+cubecl-std = { path = "../cubecl-std", version = "0.11.0", features = [
+    "export_tests",
+] }
+half = { workspace = true }
+paste = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+wgpu = { workspace = true, features = ["noop"] }
+
+[build-dependencies]
+cfg_aliases = { workspace = true }

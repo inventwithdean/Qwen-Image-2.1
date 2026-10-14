@@ -1,0 +1,48 @@
+use cfg_aliases::cfg_aliases;
+use std::env;
+
+fn main() {
+    // Setup cfg aliases
+    cfg_aliases! {
+        apple_silicon: { all(target_os = "macos", target_arch = "aarch64") },
+        // Renderdoc adds a compile time error on MacOS and iOS
+        renderdoc: { all(feature = "renderdoc", not(any(target_os = "macos", target_os = "ios"))) }
+    }
+
+    println!("cargo:rerun-if-env-changed=CUBECL_VULKAN_VALIDATE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STD");
+
+    if env::var("CUBECL_VULKAN_VALIDATE").is_ok() {
+        println!("cargo:rustc-cfg=feature=\"vulkan-validate\"");
+    }
+
+    if env::var("CUBECL_ENABLE_RENDERDOC").is_ok() {
+        println!("cargo:rustc-cfg=feature=\"renderdoc\"");
+    }
+
+    // Check if we are on macOS
+    // Errors out on MacOS when the "spirv" feature is enabled and the Vulkan SDK is not installed.
+    // To install Vulkan SDK visit https://vulkan.lunarg.com/sdk/home#mac
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SPIRV");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+
+    // Automatically enable pliron-dump if an output path is set
+    println!("cargo:rerun-if-env-changed=CUBECL_DEBUG_PLIRON");
+
+    if env::var("CUBECL_DEBUG_PLIRON").is_ok() && env::var("CARGO_FEATURE_STD").is_ok() {
+        println!("cargo:rustc-cfg=feature=\"pliron-dump\"");
+    }
+
+    let is_macos = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos");
+    if is_macos {
+        println!("cargo:rustc-cfg=feature=\"vulkan-portability\"");
+    }
+    let spirv_feature_enabled = env::var("CARGO_FEATURE_SPIRV").is_ok();
+    let vulkan_sdk_installed = env::var("VULKAN_SDK").is_ok();
+    if is_macos && spirv_feature_enabled && !vulkan_sdk_installed {
+        let msg = "The Vulkan SDK is required on macOS when the 'spirv' feature is enabled. Install the Vulkan SDK and make sure the VULKAN_SDK environment variable is set. Visit https://vulkan.lunarg.com/sdk/home#mac to learn how to install it.";
+        println!("cargo:warning={msg}");
+        panic!("{msg}");
+    }
+}
