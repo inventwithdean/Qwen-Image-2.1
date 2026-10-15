@@ -57,9 +57,6 @@ The core logic mapping Rust functions to JavaScript is heavily centralized in `l
 * **Image Decoding:** Pushes the denoised latents through the VAE to return a clean `DecodedImage` containing the final RGBA pixel array.
 
 
-
-To bypass the browser's strict memory limitations, the engine avoids keeping the entire model in RAM simultaneously. The `worker.js` script utilizes remote procedure calls from `rpc.js` to trigger generation off the main thread. Meanwhile, `streamer.rs` and `store.js` work in tandem to lazily stream the 32 DiT layers and 36 Text Encoder layers directly from the OPFS cache as the forward pass progresses.
-
 ## License
 
 The inference code is distributed under the MIT license, while the model weights fall under the Qwen-Research license. Built leveraging the Burn framework, CubeCL, and wgpu.
