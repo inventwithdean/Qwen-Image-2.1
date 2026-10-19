@@ -244,11 +244,11 @@ struct QwenImageSwiGLUFeedForward {
 impl QwenImageSwiGLUFeedForward {
     // Doing compute in F16
     fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
-        let hidden_states = hidden_states.cast(FloatDType::F16);
+        // let hidden_states = hidden_states.cast(FloatDType::F16);
         let gate_out = silu(self.gate_layer.forward(hidden_states.clone()));
         let other = self.proj.forward(hidden_states);
 
-        self.out.forward(gate_out * other).cast(FloatDType::F32)
+        self.out.forward(gate_out * other)//.cast(FloatDType::F32)
     }
 }
 
